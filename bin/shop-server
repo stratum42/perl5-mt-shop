@@ -25,6 +25,7 @@ BEGIN {
 use Getopt::Long qw(GetOptions);
 use JSON::PP qw(encode_json decode_json);
 use IO::Socket::INET;
+use IO::Poll qw(POLLIN POLLHUP POLLERR POLLNVAL);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use POSIX qw(dup);
 use File::Path qw(make_path);
@@ -90,6 +91,7 @@ package Shop::Server;
 
 use strict;
 use warnings;
+use IO::Poll qw(POLLIN POLLHUP POLLERR POLLNVAL);
 use Time::HiRes qw(time usleep);
 
 sub _decode_cfg {
@@ -128,11 +130,11 @@ sub checkpoint_worker {
 }
 
 sub reaper_worker {
-    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
     my $cfg      = _decode_cfg($cfg_blob);
     my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
     my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
-    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
+    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
     my $shutdown = MT::Cell->attach($shutdown_id);
     my $db       = Shop::DB->new($cfg->{db});
     my $hostkey  = Shop::SSH::Wire::load_or_generate_hostkey($cfg->{ssh}{host_key} // 'config/host_ed25519_key');
@@ -196,9 +198,9 @@ sub reaper_worker {
 }
 
 sub ops_worker {
-    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
     my $cfg      = _decode_cfg($cfg_blob);
-    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
+    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
     my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
     my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
     my $shutdown = MT::Cell->attach($shutdown_id);
@@ -237,11 +239,11 @@ sub ops_worker {
 }
 
 sub session_worker {
-    my ($worker_idx, $cfg_blob, $products_id, $cells_id, $sessions_id, $m_cells_id, $m_rl_id, $conn_chan_id, $shutdown_id) = @_;
+    my ($worker_idx, $cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $conn_chan_id, $shutdown_id) = @_;
     my $cfg      = _decode_cfg($cfg_blob);
     my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
     my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
-    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
+    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
     my $conn_ch  = MT::Channel->attach($conn_chan_id);
     my $shutdown = MT::Cell->attach($shutdown_id);
 
@@ -262,13 +264,42 @@ sub session_worker {
         : Shop::Payment::Mock->new();
 
     my $active_fibers = 0;
+    my $poll          = IO::Poll->new();
+    my %parked;
+    my %fd_to_fid;
 
-    # Dispatcher fiber accepts fds from $conn_ch and spawns per-connection MT::Fibers
+    my $on_idle = sub {
+        my ($s, $inbox, $wake_at) = @_;
+        return 0 if $shutdown->get();
+        return 1 if $inbox && $inbox->len() > 0;
+        my $fid = MT::Fiber::current();
+        if ($fid && $s && defined(fileno($s))) {
+            my $fd = fileno($s);
+            $parked{$fid} = {
+                sock    => $s,
+                fd      => $fd,
+                inbox   => $inbox,
+                wake_at => $wake_at || 0,
+            };
+            $fd_to_fid{$fd} = $fid;
+            $poll->mask($s => POLLIN);
+            MT::Fiber::park();
+            return $shutdown->get() ? 0 : 1;
+        }
+        MT::Fiber::pass();
+        return $shutdown->get() ? 0 : 1;
+    };
+
+    # Dispatcher fiber accepts fds from $conn_ch and wakes parked session fibers via IO::Poll
     MT::Fiber::schedule(sub {
         while (!$shutdown->get()) {
             MT::Supervisor::beat();
-            my ($ok, $fd) = $conn_ch->try_recv();
-            if ($ok && defined $fd && $fd >= 0) {
+
+            my $accepted = 0;
+            while ($accepted < 64 && !$shutdown->get()) {
+                my ($ok, $fd) = $conn_ch->try_recv();
+                last unless $ok && defined $fd && $fd >= 0;
+                $accepted++;
                 $active_fibers++;
                 my $client_fd = $fd;
                 MT::Fiber::schedule(sub {
@@ -347,6 +378,7 @@ sub session_worker {
                             membership   => $membership,
                             subscription => $subscription,
                             user         => $user,
+                            on_idle      => $on_idle,
                         );
                         $app->run();
                     };
@@ -357,11 +389,56 @@ sub session_worker {
                     $metrics->dec('ssh_active_sessions', 1) if $session_counted;
                     $active_fibers--;
                 });
-                MT::Fiber::pass();
-            } else {
-                MT::Fiber::pass();
-                usleep($active_fibers > 0 ? 1_000 : 10_000);
             }
+
+            my $woke = 0;
+            if (%parked) {
+                my $now  = time();
+                my $shut = $shutdown->get();
+                for my $fid (keys %parked) {
+                    my $entry       = $parked{$fid};
+                    my $inbox_ready = $entry->{inbox} && $entry->{inbox}->len() > 0;
+                    my $timer_due   = $entry->{wake_at} && $entry->{wake_at} <= $now;
+                    if ($shut || $inbox_ready || $timer_due) {
+                        delete $parked{$fid};
+                        delete $fd_to_fid{$entry->{fd}} if defined $entry->{fd};
+                        eval { $poll->remove($entry->{sock}) } if $entry->{sock};
+                        MT::Fiber::wake($fid);
+                        $woke++;
+                    }
+                }
+            }
+
+            my $n_parked     = scalar(keys %parked);
+            my $has_runnable = ($accepted > 0 || $woke > 0 || $active_fibers > $n_parked || $shutdown->get());
+            my $timeout      = $has_runnable ? 0 : 0.01;
+
+            if ($n_parked > 0) {
+                my $nready = $poll->poll($timeout);
+                if ($nready > 0) {
+                    for my $h ($poll->handles(POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+                        my $fd  = defined($h) ? fileno($h) : undef;
+                        my $fid = defined($fd) ? delete $fd_to_fid{$fd} : undef;
+                        eval { $poll->remove($h) };
+                        if (defined $fid && exists $parked{$fid}) {
+                            delete $parked{$fid};
+                            MT::Fiber::wake($fid);
+                        }
+                    }
+                }
+            } elsif ($timeout > 0) {
+                usleep(10_000);
+            }
+
+            MT::Fiber::pass();
+        }
+
+        # Wake any remaining parked fibers on shutdown so MT::Fiber::run() exits cleanly
+        for my $fid (keys %parked) {
+            my $entry = delete $parked{$fid};
+            delete $fd_to_fid{$entry->{fd}} if $entry && defined $entry->{fd};
+            eval { $poll->remove($entry->{sock}) } if $entry && $entry->{sock};
+            eval { MT::Fiber::wake($fid) };
         }
     });
 
@@ -452,7 +529,7 @@ my $m_ids   = $metrics->state_ids();
 
 # Shared shutdown flag and incoming client fd channel
 my $shutdown_cell = MT::Cell->new(0);
-my $conn_chan     = MT::Channel->new(256);
+my $conn_chan     = MT::Channel->new(1024);
 
 # Register MT::Fault observer
 MT::Fault::on(sub {
@@ -483,7 +560,7 @@ push @workers, MT::Worker::spawn(
 push @workers, MT::Worker::spawn(
     'Shop::Server::reaper_worker',
     $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id},
-    $eb_ids->{sessions_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
+    $eb_ids->{sessions_id}, $eb_ids->{free_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
 );
 
 my $ops_port = defined($cfg->{ops}{port}) ? int($cfg->{ops}{port}) : 8088;
@@ -492,7 +569,7 @@ if ($ops_port > 0) {
     push @workers, MT::Worker::spawn(
         'Shop::Server::ops_worker',
         $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id},
-        $eb_ids->{sessions_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
+        $eb_ids->{sessions_id}, $eb_ids->{free_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
     );
 }
 
@@ -503,7 +580,7 @@ for my $idx (1 .. $n_sess) {
         'Shop::Server::session_worker',
         $idx, $cfg_json,
         $inv_ids->{products_id}, $inv_ids->{cells_id},
-        $eb_ids->{sessions_id},
+        $eb_ids->{sessions_id}, $eb_ids->{free_id},
         $m_ids->{cells_id}, $m_ids->{ratelimit_id},
         $conn_chan->id,
         $shutdown_cell->id
@@ -518,7 +595,7 @@ my $server = IO::Socket::INET->new(
     LocalAddr => $listen_host,
     LocalPort => $listen_port,
     Proto     => 'tcp',
-    Listen    => 128,
+    Listen    => 1024,
     ReuseAddr => 1,
 ) or die "Cannot listen on $listen_host:$listen_port: $!\n";
 
@@ -539,8 +616,11 @@ print "[shop-server] Listening on ssh://$listen_host:$listen_port "
 
 my $last_sup_tick = time();
 while (!$stop) {
-    my $client = $server->accept();
-    if ($client) {
+    my $accepted = 0;
+    while ($accepted < 64 && !$stop) {
+        my $client = $server->accept();
+        last unless $client;
+        $accepted++;
         my $peer_ip = eval { $client->peerhost() } || 'unknown';
         if ($rate_limit > 0 && !$metrics->check_rate_limit($peer_ip, $rate_limit)) {
             close($client);
@@ -553,8 +633,9 @@ while (!$stop) {
                 $conn_chan->send($dup_fd);
             }
         }
-    } else {
-        usleep(5_000); # 5ms accept poll
+    }
+    if ($accepted == 0) {
+        usleep(5_000); # 5ms accept poll when idle
     }
 
     my $now = time();

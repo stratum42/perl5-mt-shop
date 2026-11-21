@@ -343,6 +343,11 @@ sub transport {
     return $self->{transport};
 }
 
+sub sock {
+    my ($self) = @_;
+    return $self->{transport} ? $self->{transport}->sock : undef;
+}
+
 sub env {
     my ($self) = @_;
     return { %{ $self->{env} } };

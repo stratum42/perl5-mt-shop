@@ -102,6 +102,7 @@ sub new {
         subscription => $args{subscription},
         user         => $user,
         inbox        => $args{inbox},
+        on_idle      => $args{on_idle},
         _member_tier => '',
 
         screen       => Shop::TUI::Screen->new(cols => $cols, rows => $rows, env => $env),
@@ -802,10 +803,24 @@ sub run {
             }
         }
 
-        # 6. Yield cooperatively to other fibers (never block the worker OS thread
-        # with usleep inside a fiber - the worker dispatcher owns idle backoff!)
+        # 6. Yield cooperatively to other fibers (park when idle if on_idle is provided)
         if (defined(&MT::Fiber::current) && MT::Fiber::current()) {
-            MT::Fiber::pass();
+            if (!$did_work && $self->{on_idle} && $self->{running}) {
+                my $next_timer_ts = 0;
+                if (length($self->{toast_msg}) && $self->{toast_until} > 0) {
+                    $next_timer_ts = $self->{toast_until};
+                }
+                if (length($self->{broadcast}) && $self->{broadcast_until} > 0) {
+                    if (!$next_timer_ts || $self->{broadcast_until} < $next_timer_ts) {
+                        $next_timer_ts = $self->{broadcast_until};
+                    }
+                }
+                my $sock = $sess->can('sock') ? $sess->sock() : undef;
+                my $keep_going = $self->{on_idle}->($sock, $self->{inbox}, $next_timer_ts);
+                $self->{running} = 0 if defined($keep_going) && !$keep_going;
+            } else {
+                MT::Fiber::pass();
+            }
         } elsif (!$did_work) {
             usleep(10_000); # standalone non-fiber mode only
         }

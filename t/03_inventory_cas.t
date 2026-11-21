@@ -88,6 +88,29 @@ is(scalar(@$events), 5, 'EventBus delivered 5 cross-worker broadcast events to m
 $bus->unregister_session('sess-main');
 is(scalar(@{ $bus->list_sessions }), 0, 'session unregistered cleanly');
 
+# Verify EventBus channel recycling: 50 sequential register/unregister cycles reuse 1 channel ID
+{
+    my $rbus = Shop::State::EventBus->new;
+    my $first_ch = $rbus->register_session('recycle-0', { user_fp => 'SHA256:r', username => 'rec' });
+    my $first_id = $first_ch->id;
+    $rbus->broadcast({ type => 'stale_msg', seq => 0 });
+    $rbus->unregister_session('recycle-0');
+
+    my $same_id_count = 0;
+    my $stale_seen    = 0;
+    for my $i (1 .. 50) {
+        my $ch = $rbus->register_session("recycle-$i", { user_fp => 'SHA256:r', username => 'rec' });
+        $same_id_count++ if $ch->id == $first_id;
+        my $evs = $rbus->poll_inbox($ch);
+        $stale_seen += scalar(@$evs);
+        $rbus->broadcast({ type => 'stale_msg', seq => $i });
+        $rbus->unregister_session("recycle-$i");
+    }
+    is($same_id_count, 50, 'all 50 sequential register/unregister cycles reused the exact same channel ID');
+    is($stale_seen, 0, 'recycled channel had 0 stale events leaked across sessions');
+    is($rbus->recycled_count(), 50, 'recycled_count() reports 50 recycled channels');
+}
+
 # Test release + catalog filtering
 is($inv->release('VT-220', 2), 2, 'release restores stock atomically');
 my $terms = $inv->list_catalog(category => 'Terminals');
