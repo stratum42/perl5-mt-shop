@@ -140,11 +140,15 @@ When `ops.port > 0` (default `127.0.0.1:8088`), `Shop::Webhook::Server` runs
 - `GET /api/catalog`: Returns `200 OK` JSON (`{"ok":true,"count":N,"items":[...]}`)
   from the in-process hot `Shop::State::Inventory` (supports optional
   `category` and `q` query parameters).
+- `GET /api/memberships`: Returns `200 OK` JSON (`{"ok":true,"count":N,"tiers":[...]}`)
+  listing active membership tiers and benefits.
 - `POST /webhooks/stripe`: Verifies the `Stripe-Signature` header
   (`t=<ts>,v1=<hex>`) using constant-time HMAC-SHA256 with a 300-second
   timestamp tolerance, checks an `MT::SharedHash` idempotency store, updates
-  order status in the database, and pushes a notification to the buyer's open
-  SSH session via `EventBus`.
+  order, membership, or subscription status in the database (including
+  `invoice.paid`, `customer.subscription.updated`, and
+  `customer.subscription.deleted`), and pushes a notification to the buyer's
+  open SSH session via `EventBus`.
 - `POST /webhooks/shippo`: Verifies the HMAC-SHA256 signature against
   `SHIPPO_WEBHOOK_SECRET`, maps carrier tracking events (`PRE_TRANSIT`,
   `TRANSIT`/`IN_TRANSIT`, `OUT_FOR_DELIVERY`, `DELIVERED`,
@@ -175,6 +179,15 @@ In the Admin view (`5`), press `l` or `L` to open the `[L] Logistics` sub-tab:
    - The Logistics sub-tab also displays state-level YTD sales and transaction
      counts against `tax_nexus` thresholds (`REGISTERED`, `NEXUS_REQUIRED`,
      `APPROACHING`, `OK`).
+
+## Scheduled Subscription Renewals
+
+`Shop::Server::reaper_worker` runs `Shop::Domain::Subscription::process_due_renewals()`
+on a periodic timer (controlled by `workers.renewal_interval_sec`, default 60 s).
+Each due cycle acquires an idempotency lock (`sub:renew:<id>:<next_bill_at>`) in
+KeyDB (or in-process fallback) so a billing cycle is never double-billed, places
+the renewal order via `Shop::Domain::Checkout::quick_reorder`, advances
+`next_bill_at`, and pushes a `subscription_renewed` notification over `EventBus`.
 
 ## Shutdown and Checkpoints
 

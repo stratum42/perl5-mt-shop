@@ -31,10 +31,13 @@ terminal UI.
 - Multi-warehouse fulfillment routing (`DAL1`, `NYC1`, `SFO1`), inbound
   purchase order receiving, Shippo carrier rate quotes and labels, and
   state-level tax nexus calculation.
+- Memberships (`FREE`, `PRO`, `FOUNDER`) with automatic `MT::Decimal` member
+  discounts and free shipping, plus recurring product subscriptions with
+  idempotent scheduled renewals and Admin MRR reporting.
 - Embedded HTTP ops and webhook worker (`Shop::Web::App` on `mojolicious-mt`
   with `Mojo::Server::Daemon`, `Mojo::Reactor::MT`, and `Mojo::MT::Accel`)
   serving `GET /healthz`, Prometheus `GET /metrics`, `GET /api/catalog`,
-  `POST /webhooks/stripe`, and `POST /webhooks/shippo`.
+  `GET /api/memberships`, `POST /webhooks/stripe`, and `POST /webhooks/shippo`.
 
 ## Requirements
 
@@ -90,12 +93,15 @@ To grant admin access to an SSH key, add its `SHA256:...` fingerprint to
 
 | Key / Input | Action |
 |---|---|
-| `1`..`5` or Mouse Click | Switch views: Shop, Cart, Orders, Account, Admin |
+| `1`..`5`, `8` or Mouse Click | Switch views: Shop, Cart, Orders, Account, Admin, Subscriptions |
 | `Up`/`Down`, `j`/`k`, Wheel | Move selection in lists |
 | `/` | Catalog search (or SKU scan in Admin Logistics) |
 | `Tab` / `[` `]` | Switch category or Admin sub-tabs |
 | `Enter` | Open product detail or confirm action |
 | `a` | Add selected item to cart |
+| `S` (Product Detail) | Create a 30-day recurring subscription for the item |
+| `1`/`2`/`3`, `u`, `x` (Subscriptions) | Enroll/upgrade membership tier or cancel membership |
+| `p`, `k`, `c` (Subscriptions) | Pause/resume, skip next delivery, or cancel selected subscription |
 | `R` / `f` | Express reorder using saved payment method and default address |
 | `+` / `-` | Adjust quantity or stock |
 | `s` / `Left` `Right` (Checkout) | Cycle shipping carrier rates |

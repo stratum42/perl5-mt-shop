@@ -177,6 +177,163 @@ sub _map_shippo_status {
     return ($st || 'UNKNOWN',   undef);
 }
 
+sub _utc_ts {
+    my ($epoch) = @_;
+    $epoch = time() unless defined $epoch;
+    my ($S, $M, $H, $d, $m, $y) = gmtime($epoch);
+    return sprintf('%04d-%02d-%02d %02d:%02d:%02d', $y + 1900, $m + 1, $d, $H, $M, $S);
+}
+
+sub _map_stripe_sub_status {
+    my ($ev_type, $raw) = @_;
+    return 'CANCELED' if ($ev_type // '') eq 'customer.subscription.deleted';
+    return 'ACTIVE'   if ($ev_type // '') eq 'invoice.paid';
+    my $st = lc($raw // 'active');
+    return 'ACTIVE'   if $st eq 'active' || $st eq 'trialing';
+    return 'PAUSED'   if $st eq 'paused';
+    return 'PAST_DUE' if $st eq 'past_due';
+    return 'CANCELED' if $st eq 'canceled' || $st eq 'cancelled' || $st eq 'unpaid' || $st eq 'incomplete_expired';
+    return uc($st);
+}
+
+sub _handle_stripe_subscription_event {
+    my ($ev, $db, $event_bus, $metrics) = @_;
+    my $ev_type = $ev->{type} // '';
+    return undef unless $ev_type eq 'invoice.paid'
+        || $ev_type eq 'customer.subscription.updated'
+        || $ev_type eq 'customer.subscription.deleted';
+
+    my $event_id = $ev->{id} // '';
+    my $obj = ($ev->{data} && ref($ev->{data}) eq 'HASH' && ref($ev->{data}{object}) eq 'HASH')
+        ? $ev->{data}{object}
+        : $ev;
+    my $meta = ref($obj->{metadata}) eq 'HASH' ? $obj->{metadata} : {};
+
+    my $user_fp   = $meta->{user_fp}   // $obj->{user_fp}   // '';
+    my $tier_code = uc($meta->{tier_code} // $obj->{tier_code} // '');
+    my $sub_id    = $meta->{subscription_id} // $meta->{sub_id} // $obj->{subscription_id} // '';
+    my $stripe_sub_id = ($ev_type eq 'invoice.paid' ? ($obj->{subscription} // '') : ($obj->{id} // ''))
+                     || ($obj->{stripe_sub_id} // '');
+
+    my $mapped_status = _map_stripe_sub_status($ev_type, $obj->{status});
+
+    my ($sub, $updated_membership);
+    if ($db) {
+        if (length($sub_id) && $db->can('get_subscription')) {
+            $sub = eval { $db->get_subscription($sub_id) };
+        }
+        if (!$sub && length($stripe_sub_id) && $db->can('list_subscriptions')) {
+            my $rows = eval { $db->list_subscriptions($user_fp) } || [];
+            for my $row (@$rows) {
+                if (($row->{stripe_sub_id} // '') eq $stripe_sub_id) {
+                    $sub = $row;
+                    last;
+                }
+            }
+        }
+        if ($sub && !length($user_fp)) {
+            $user_fp = $sub->{user_fp} // '';
+        }
+
+        if ($sub && $db->can('update_subscription')) {
+            my %patch = (status => $mapped_status);
+            if ($ev_type eq 'invoice.paid' && defined $obj->{period_end} && $obj->{period_end} =~ /^\d+$/) {
+                $patch{next_bill_at} = _utc_ts(int($obj->{period_end}));
+            }
+            if (defined $meta->{order_id} && length $meta->{order_id}) {
+                $patch{last_order_id} = $meta->{order_id};
+            }
+            eval { $db->update_subscription($sub->{id}, %patch); };
+        }
+
+        if (length($user_fp) && $db->can('upsert_membership')) {
+            my $cur = $db->can('get_membership') ? eval { $db->get_membership($user_fp) } : undef;
+            my $matches_mem = length($tier_code)
+                || ($cur && (!length($stripe_sub_id)
+                    || !length($cur->{stripe_sub_id} // '')
+                    || ($cur->{stripe_sub_id} // '') eq $stripe_sub_id));
+            if ($matches_mem) {
+                my $eff_tier = length($tier_code)
+                    ? $tier_code
+                    : ($cur ? ($cur->{tier_code} // 'PRO') : 'PRO');
+                my $renews_at = '';
+                if ($mapped_status eq 'ACTIVE') {
+                    my $pe = $obj->{current_period_end} // $obj->{period_end};
+                    $renews_at = (defined $pe && $pe =~ /^\d+$/)
+                        ? _utc_ts(int($pe))
+                        : _utc_ts(time() + 30 * 86400);
+                }
+                elsif ($cur) {
+                    $renews_at = $cur->{renews_at} // '';
+                }
+                eval {
+                    $db->upsert_membership({
+                        user_fp       => $user_fp,
+                        tier_code     => $eff_tier,
+                        status        => $mapped_status,
+                        stripe_sub_id => length($stripe_sub_id) ? $stripe_sub_id : ($cur ? ($cur->{stripe_sub_id} // '') : ''),
+                        renews_at     => $renews_at,
+                    });
+                };
+                $updated_membership = {
+                    user_fp   => $user_fp,
+                    tier_code => $eff_tier,
+                    status    => $mapped_status,
+                };
+            }
+        }
+    }
+
+    $metrics->inc('webhooks_processed_total', 1) if $metrics;
+
+    if ($updated_membership && $event_bus) {
+        $event_bus->send_to_user($user_fp, {
+            type      => 'membership_updated',
+            user_fp   => $user_fp,
+            tier_code => $updated_membership->{tier_code},
+            status    => $mapped_status,
+            event_id  => $event_id,
+            ts        => time(),
+        });
+    }
+
+    if ($sub && $event_bus) {
+        if ($ev_type eq 'invoice.paid') {
+            my $total = defined $obj->{amount_paid}
+                ? sprintf('%.2f', int($obj->{amount_paid}) / 100)
+                : '' . ($sub->{unit_price} // '0.00');
+            $event_bus->send_to_user($sub->{user_fp}, {
+                type     => 'subscription_renewed',
+                sub_id   => $sub->{id},
+                order_id => $meta->{order_id} // ($sub->{last_order_id} // ''),
+                sku      => $sub->{sku} // '',
+                total    => $total,
+                status   => $mapped_status,
+                event_id => $event_id,
+                ts       => time(),
+            });
+        }
+        else {
+            $event_bus->send_to_user($sub->{user_fp}, {
+                type     => 'subscription_updated',
+                sub_id   => $sub->{id},
+                sku      => $sub->{sku} // '',
+                status   => $mapped_status,
+                event_id => $event_id,
+                ts       => time(),
+            });
+        }
+    }
+
+    return {
+        event_type => $ev_type,
+        status     => $mapped_status,
+        user_fp    => $user_fp,
+        tier_code  => $updated_membership ? $updated_membership->{tier_code} : $tier_code,
+        sub_id     => $sub ? $sub->{id} : $sub_id,
+    };
+}
+
 sub listen {
     my ($self) = @_;
 
@@ -327,6 +484,29 @@ sub handle_request {
         return _http_response(200, 'OK', 'text/plain; version=0.0.4; charset=utf-8', $text);
     }
 
+    if ($method eq 'GET' && $path eq '/api/memberships') {
+        my @tiers;
+        if ($self->{db} && $self->{db}->can('list_membership_tiers')) {
+            my $rows = eval { $self->{db}->list_membership_tiers } || [];
+            for my $t (@$rows) {
+                push @tiers, {
+                    code                 => $t->{code} // '',
+                    name                 => $t->{name} // '',
+                    monthly_price        => defined $t->{monthly_price} ? "$t->{monthly_price}" : '0.00',
+                    discount_pct         => defined $t->{discount_pct}  ? "$t->{discount_pct}"  : '0.00',
+                    free_shipping        => $t->{free_shipping}        ? \1 : \0,
+                    priority_fulfillment => $t->{priority_fulfillment} ? \1 : \0,
+                    active               => (!defined $t->{active} || $t->{active}) ? \1 : \0,
+                };
+            }
+        }
+        return _json_response(200, 'OK', {
+            ok    => \1,
+            count => scalar(@tiers),
+            tiers => \@tiers,
+        });
+    }
+
     if ($method eq 'POST' && $path eq '/webhooks/stripe') {
         my $sig_hdr = $headers->{'stripe-signature'} // '';
         if (!verify_stripe_signature($body, $sig_hdr, $self->{webhook_secret}, $self->{tolerance_sec})) {
@@ -341,6 +521,13 @@ sub handle_request {
         my $event_id = $ev->{id};
         if (!$self->_check_and_mark_idempotent($event_id)) {
             return _json_response(200, 'OK', { ok => \1, duplicate => \1 });
+        }
+
+        if (my $sub_res = _handle_stripe_subscription_event($ev, $self->{db}, $self->{event_bus}, $self->{metrics})) {
+            return _json_response(200, 'OK', {
+                ok => \1,
+                %$sub_res,
+            });
         }
 
         my $obj = ($ev->{data} && ref($ev->{data}) eq 'HASH' && ref($ev->{data}{object}) eq 'HASH')

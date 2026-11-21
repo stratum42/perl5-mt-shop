@@ -9,13 +9,13 @@
 | Driver | Module | Schema | Stored Procedures | Transport |
 |---|---|---|---|---|
 | `sqlite` | `Shop::DB::SQLite` | `sql/schema_sqlite.sql` | N/A (local embedded) | Direct SQLite file (`var/shop.db`) |
-| `db2` | `Shop::DB::Db2` | `sql/schema_db2.sql` | `sql/procs_db2.sql` (42 SQL PL procs) | HTTP gateway (`127.0.0.1:50050`) -> Db2 (`:50000`) |
-| `informix` | `Shop::DB::Informix` | `sql/schema_informix.sql` | `sql/procs_informix.sql` (42 SPL procs) | HTTP gateway (`127.0.0.1:50051`) -> Informix DRDA (`:9089`) |
+| `db2` | `Shop::DB::Db2` | `sql/schema_db2.sql` | `sql/procs_db2.sql` (51 SQL PL procs) | HTTP gateway (`127.0.0.1:50050`) -> Db2 (`:50000`) |
+| `informix` | `Shop::DB::Informix` | `sql/schema_informix.sql` | `sql/procs_informix.sql` (51 SPL procs) | HTTP gateway (`127.0.0.1:50051`) -> Informix DRDA (`:9089`) |
 
 All three schemas share the same core tables:
 `products`, `users`, `addresses`, `promo_codes`, `orders`, `order_items`,
 `warehouses`, `warehouse_stock`, `purchase_orders`, `po_lines`, `shipments`,
-and `tax_nexus`.
+`tax_nexus`, `membership_tiers`, `memberships`, and `subscriptions`.
 
 Select the driver in `config/shop.json` (`db.driver`), via `--db-driver
 sqlite|db2|informix`, or with the `SHOP_DB_DRIVER` environment variable.
@@ -40,7 +40,7 @@ When enabled:
 - Ad-hoc SQL endpoints (`/query`, `/tx/query`, `/tx/exec`) return HTTP `403`
   (`SQL_INJECTION_BLOCKED`).
 - All runtime reads and writes go through `POST /sp/call` and
-  `POST /tx/sp/call` against an explicit allowlist of 42 static `SHOP_SP_*`
+  `POST /tx/sp/call` against an explicit allowlist of 51 static `SHOP_SP_*`
   procedures with checked parameter arity. None of the procedures use dynamic
   SQL (`PREPARE` / `EXECUTE IMMEDIATE`).
 - Schema bootstrap (`POST /admin/ddl`) is gated by `X-Admin-Key`
@@ -67,23 +67,24 @@ exact decimal values without binary floating-point conversion:
 
 ## Temporal Tables, Trigger Audit, and Constraints
 
-- **Db2 System-Period Temporal Tables**: `products`, `orders`, and `shipments`
-  define `PERIOD SYSTEM_TIME (sys_start, sys_end)` with `TIMESTAMP(12)`
-  generated columns, an implicitly hidden `trans_start` column, and paired
-  history tables (`products_history`, `orders_history`, `shipments_history`)
-  with `COMPRESS YES ADAPTIVE`. History queries use `FOR SYSTEM_TIME` via
-  `SHOP_SP_PRODUCT_HISTORY`, `SHOP_SP_CATALOG_AS_OF`, and
-  `SHOP_SP_ORDER_HISTORY`. Atomic updates use `SELECT FROM FINAL TABLE` and
-  upserts use `MERGE INTO`.
-- **Informix SPL Audit Triggers**: `products_audit`, `orders_audit`, and
-  `shipments_audit` are populated by `CREATE TRIGGER` + SPL routines in
-  `sql/procs_informix.sql`, exposing the same history query shapes to
-  `Shop::DB`.
+- **Db2 System-Period Temporal Tables**: `products`, `orders`, `shipments`,
+  and `subscriptions` define `PERIOD SYSTEM_TIME (sys_start, sys_end)` with
+  `TIMESTAMP(12)` generated columns, an implicitly hidden `trans_start` column,
+  and paired history tables (`products_history`, `orders_history`,
+  `shipments_history`, `subscriptions_history`) with `COMPRESS YES ADAPTIVE`.
+  History queries use `FOR SYSTEM_TIME` via `SHOP_SP_PRODUCT_HISTORY`,
+  `SHOP_SP_CATALOG_AS_OF`, and `SHOP_SP_ORDER_HISTORY`. Atomic updates use
+  `SELECT FROM FINAL TABLE` and upserts use `MERGE INTO`.
+- **Informix SPL Audit Triggers**: `products_audit`, `orders_audit`,
+  `shipments_audit`, and `subscriptions_audit` are populated by
+  `CREATE TRIGGER` + SPL routines in `sql/procs_informix.sql`, exposing the
+  same history query shapes to `Shop::DB`.
 - **SQLite**: Provides fallback implementations of the history and OLAP
   methods so the TUI and test suite run locally without Docker.
 - **Database Constraints**: `CHECK` constraints enforce `stock >= 0`,
   `price >= 0`, `qty > 0` on `order_items`, `qty >= 0` on `warehouse_stock`,
-  and `qty_ordered > 0` / `qty_received >= 0` on `po_lines`.
+  `qty_ordered > 0` / `qty_received >= 0` on `po_lines`, and `qty > 0` /
+  `interval_days >= 7` on `subscriptions`.
 
 ## OLAP Rollup and Masked Views
 
@@ -106,6 +107,8 @@ exact decimal values without binary floating-point conversion:
 - 2 sample inbound purchase orders (`PO-2026-001`, `PO-2026-002`).
 - 6 state tax nexus rows (`TX`, `CA`, `NY` registered; `WA`, `FL`, `IL`
   monitored).
+- 3 membership tiers (`FREE`, `PRO` at $9.99/mo with 10% off and free shipping,
+  `FOUNDER` at $24.99/mo with 20% off and free shipping).
 
 ### Initializing Each Backend
 

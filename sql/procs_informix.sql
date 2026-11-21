@@ -1864,3 +1864,533 @@ CREATE OR REPLACE PROCEDURE shop_sp_tax_nexus_report()
                TRIM(TO_CHAR(v_ytd_dec)), v_ytd_txns WITH RESUME;
     END FOREACH;
 END PROCEDURE@
+
+-- =========================================================================
+-- Memberships and Recurring Subscriptions (+ SPL trigger audit, SP_ONLY)
+-- =========================================================================
+
+CREATE OR REPLACE PROCEDURE shop_trg_subscriptions_ins(
+    p_id            VARCHAR(64),
+    p_user_fp       VARCHAR(128),
+    p_sku           VARCHAR(32),
+    p_qty           INTEGER,
+    p_interval_days INTEGER,
+    p_unit_price    DECIMAL(32,4),
+    p_status        VARCHAR(32),
+    p_next_bill_at  VARCHAR(64),
+    p_last_order_id VARCHAR(64)
+)
+    DEFINE v_now DATETIME YEAR TO FRACTION(5);
+    DEFINE v_max DATETIME YEAR TO FRACTION(5);
+    LET v_now = CURRENT YEAR TO FRACTION(5);
+    LET v_max = DATETIME(9999-12-30 00:00:00.00000) YEAR TO FRACTION(5);
+
+    INSERT INTO subscriptions_audit (
+        id, user_fp, sku, qty, interval_days, unit_price,
+        status, next_bill_at, last_order_id, op, sys_start, sys_end
+    ) VALUES (
+        p_id, p_user_fp, p_sku, p_qty, p_interval_days, p_unit_price,
+        p_status, p_next_bill_at, p_last_order_id, 'I', v_now, v_max
+    );
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_trg_subscriptions_upd(
+    p_id            VARCHAR(64),
+    p_user_fp       VARCHAR(128),
+    p_sku           VARCHAR(32),
+    p_qty           INTEGER,
+    p_interval_days INTEGER,
+    p_unit_price    DECIMAL(32,4),
+    p_status        VARCHAR(32),
+    p_next_bill_at  VARCHAR(64),
+    p_last_order_id VARCHAR(64)
+)
+    DEFINE v_now DATETIME YEAR TO FRACTION(5);
+    DEFINE v_max DATETIME YEAR TO FRACTION(5);
+    LET v_now = CURRENT YEAR TO FRACTION(5);
+    LET v_max = DATETIME(9999-12-30 00:00:00.00000) YEAR TO FRACTION(5);
+
+    UPDATE subscriptions_audit
+    SET sys_end = v_now
+    WHERE id = p_id
+      AND sys_end = v_max;
+
+    INSERT INTO subscriptions_audit (
+        id, user_fp, sku, qty, interval_days, unit_price,
+        status, next_bill_at, last_order_id, op, sys_start, sys_end
+    ) VALUES (
+        p_id, p_user_fp, p_sku, p_qty, p_interval_days, p_unit_price,
+        p_status, p_next_bill_at, p_last_order_id, 'U', v_now, v_max
+    );
+END PROCEDURE@
+
+CREATE TRIGGER trg_subscriptions_ins
+    INSERT ON subscriptions
+    REFERENCING NEW AS n
+    FOR EACH ROW (
+        EXECUTE PROCEDURE shop_trg_subscriptions_ins(
+            n.id, n.user_fp, n.sku, n.qty, n.interval_days,
+            n.unit_price, n.status, n.next_bill_at, n.last_order_id
+        )
+    )@
+
+CREATE TRIGGER trg_subscriptions_upd
+    UPDATE ON subscriptions
+    REFERENCING NEW AS n
+    FOR EACH ROW (
+        EXECUTE PROCEDURE shop_trg_subscriptions_upd(
+            n.id, n.user_fp, n.sku, n.qty, n.interval_days,
+            n.unit_price, n.status, n.next_bill_at, n.last_order_id
+        )
+    )@
+
+CREATE OR REPLACE PROCEDURE shop_sp_list_membership_tiers()
+    RETURNING
+        VARCHAR(32)  AS code,
+        VARCHAR(128) AS name,
+        VARCHAR(64)  AS monthly_price,
+        VARCHAR(64)  AS discount_pct,
+        SMALLINT     AS free_shipping,
+        SMALLINT     AS priority_fulfillment,
+        SMALLINT     AS active;
+
+    DEFINE v_code   VARCHAR(32);
+    DEFINE v_name   VARCHAR(128);
+    DEFINE v_price  VARCHAR(64);
+    DEFINE v_disc   VARCHAR(64);
+    DEFINE v_free   SMALLINT;
+    DEFINE v_prio   SMALLINT;
+    DEFINE v_active SMALLINT;
+
+    FOREACH
+        SELECT code, name, TRIM(TO_CHAR(monthly_price)), TRIM(TO_CHAR(discount_pct)),
+               free_shipping, priority_fulfillment, active
+        INTO v_code, v_name, v_price, v_disc, v_free, v_prio, v_active
+        FROM membership_tiers
+        WHERE active = 1
+        ORDER BY monthly_price ASC, code ASC
+
+        RETURN v_code, v_name, v_price, v_disc, v_free, v_prio, v_active WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_get_membership(p_user_fp VARCHAR(128))
+    RETURNING
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS tier_code,
+        VARCHAR(32)  AS status,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS started_at,
+        VARCHAR(64)  AS renews_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_user_fp    VARCHAR(128);
+    DEFINE v_tier_code  VARCHAR(32);
+    DEFINE v_status     VARCHAR(32);
+    DEFINE v_stripe_sub VARCHAR(128);
+    DEFINE v_started_at VARCHAR(64);
+    DEFINE v_renews_at  VARCHAR(64);
+    DEFINE v_updated_at VARCHAR(64);
+
+    FOREACH
+        SELECT user_fp, tier_code, status, stripe_sub_id,
+               TO_CHAR(started_at, '%Y-%m-%d %H:%M:%S.%F5'),
+               renews_at,
+               TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+        INTO v_user_fp, v_tier_code, v_status, v_stripe_sub,
+             v_started_at, v_renews_at, v_updated_at
+        FROM memberships
+        WHERE user_fp = p_user_fp
+
+        RETURN v_user_fp, v_tier_code, v_status, v_stripe_sub,
+               v_started_at, v_renews_at, v_updated_at WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_upsert_membership(
+    p_user_fp       VARCHAR(128),
+    p_tier_code     VARCHAR(32),
+    p_status        VARCHAR(32),
+    p_stripe_sub_id VARCHAR(128),
+    p_renews_at     VARCHAR(64)
+)
+    RETURNING
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS tier_code,
+        VARCHAR(32)  AS status,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS started_at,
+        VARCHAR(64)  AS renews_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_user_fp    VARCHAR(128);
+    DEFINE v_tier_code  VARCHAR(32);
+    DEFINE v_status     VARCHAR(32);
+    DEFINE v_stripe_sub VARCHAR(128);
+    DEFINE v_started_at VARCHAR(64);
+    DEFINE v_renews_at  VARCHAR(64);
+    DEFINE v_updated_at VARCHAR(64);
+
+    MERGE INTO memberships AS t
+    USING (
+        SELECT
+            p_user_fp       AS user_fp,
+            p_tier_code     AS tier_code,
+            p_status        AS status,
+            p_stripe_sub_id AS stripe_sub_id,
+            p_renews_at     AS renews_at
+        FROM sysmaster:sysdual
+    ) AS s
+    ON t.user_fp = s.user_fp
+    WHEN MATCHED THEN
+        UPDATE SET
+            t.tier_code     = NVL(s.tier_code, t.tier_code),
+            t.status        = NVL(s.status, t.status),
+            t.stripe_sub_id = NVL(s.stripe_sub_id, t.stripe_sub_id),
+            t.renews_at     = NVL(s.renews_at, t.renews_at),
+            t.updated_at    = CURRENT YEAR TO FRACTION(5)
+    WHEN NOT MATCHED THEN
+        INSERT (user_fp, tier_code, status, stripe_sub_id, renews_at)
+        VALUES (
+            s.user_fp,
+            NVL(s.tier_code, 'FREE'),
+            NVL(s.status, 'ACTIVE'),
+            NVL(s.stripe_sub_id, ''),
+            NVL(s.renews_at, '')
+        );
+
+    FOREACH
+        SELECT user_fp, tier_code, status, stripe_sub_id,
+               TO_CHAR(started_at, '%Y-%m-%d %H:%M:%S.%F5'),
+               renews_at,
+               TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+        INTO v_user_fp, v_tier_code, v_status, v_stripe_sub,
+             v_started_at, v_renews_at, v_updated_at
+        FROM memberships
+        WHERE user_fp = p_user_fp
+
+        RETURN v_user_fp, v_tier_code, v_status, v_stripe_sub,
+               v_started_at, v_renews_at, v_updated_at WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_create_subscription(
+    p_id            VARCHAR(64),
+    p_user_fp       VARCHAR(128),
+    p_sku           VARCHAR(32),
+    p_qty           INTEGER,
+    p_interval_days INTEGER,
+    p_unit_price    VARCHAR(64),
+    p_next_bill_at  VARCHAR(64),
+    p_stripe_sub_id VARCHAR(128)
+)
+    RETURNING
+        VARCHAR(64)  AS id,
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS sku,
+        INTEGER      AS qty,
+        INTEGER      AS interval_days,
+        VARCHAR(64)  AS unit_price,
+        VARCHAR(32)  AS status,
+        VARCHAR(64)  AS next_bill_at,
+        VARCHAR(64)  AS last_order_id,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS created_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_price_dec   DECIMAL(32,4);
+    DEFINE v_id          VARCHAR(64);
+    DEFINE v_user_fp     VARCHAR(128);
+    DEFINE v_sku         VARCHAR(32);
+    DEFINE v_qty         INTEGER;
+    DEFINE v_interval    INTEGER;
+    DEFINE v_unit_price  VARCHAR(64);
+    DEFINE v_status      VARCHAR(32);
+    DEFINE v_next_bill   VARCHAR(64);
+    DEFINE v_last_ord    VARCHAR(64);
+    DEFINE v_stripe_sub  VARCHAR(128);
+    DEFINE v_created_at  VARCHAR(64);
+    DEFINE v_updated_at  VARCHAR(64);
+
+    IF p_unit_price IS NULL OR p_unit_price = '' THEN
+        LET v_price_dec = 0.0000;
+    ELSE
+        LET v_price_dec = p_unit_price;
+    END IF;
+
+    INSERT INTO subscriptions (
+        id, user_fp, sku, qty, interval_days, unit_price,
+        status, next_bill_at, last_order_id, stripe_sub_id
+    ) VALUES (
+        p_id, p_user_fp, p_sku, p_qty, p_interval_days, v_price_dec,
+        'ACTIVE',
+        NVL(p_next_bill_at, ''),
+        '',
+        NVL(p_stripe_sub_id, '')
+    );
+
+    FOREACH
+        SELECT id, user_fp, sku, qty, interval_days, TRIM(TO_CHAR(unit_price)),
+               status, next_bill_at, last_order_id, stripe_sub_id,
+               TO_CHAR(created_at, '%Y-%m-%d %H:%M:%S.%F5'),
+               TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+        INTO v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+             v_status, v_next_bill, v_last_ord, v_stripe_sub,
+             v_created_at, v_updated_at
+        FROM subscriptions
+        WHERE id = p_id
+
+        RETURN v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+               v_status, v_next_bill, v_last_ord, v_stripe_sub,
+               v_created_at, v_updated_at WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_list_subscriptions(p_user_fp VARCHAR(128))
+    RETURNING
+        VARCHAR(64)  AS id,
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS sku,
+        INTEGER      AS qty,
+        INTEGER      AS interval_days,
+        VARCHAR(64)  AS unit_price,
+        VARCHAR(32)  AS status,
+        VARCHAR(64)  AS next_bill_at,
+        VARCHAR(64)  AS last_order_id,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS created_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_id         VARCHAR(64);
+    DEFINE v_user_fp    VARCHAR(128);
+    DEFINE v_sku        VARCHAR(32);
+    DEFINE v_qty        INTEGER;
+    DEFINE v_interval   INTEGER;
+    DEFINE v_unit_price VARCHAR(64);
+    DEFINE v_status     VARCHAR(32);
+    DEFINE v_next_bill  VARCHAR(64);
+    DEFINE v_last_ord   VARCHAR(64);
+    DEFINE v_stripe_sub VARCHAR(128);
+    DEFINE v_created_at VARCHAR(64);
+    DEFINE v_updated_at VARCHAR(64);
+
+    IF p_user_fp IS NULL OR p_user_fp = '' THEN
+        FOREACH
+            SELECT id, user_fp, sku, qty, interval_days, TRIM(TO_CHAR(unit_price)),
+                   status, next_bill_at, last_order_id, stripe_sub_id,
+                   TO_CHAR(created_at, '%Y-%m-%d %H:%M:%S.%F5'),
+                   TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+            INTO v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+                 v_status, v_next_bill, v_last_ord, v_stripe_sub,
+                 v_created_at, v_updated_at
+            FROM subscriptions
+            ORDER BY created_at DESC, id DESC
+
+            RETURN v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+                   v_status, v_next_bill, v_last_ord, v_stripe_sub,
+                   v_created_at, v_updated_at WITH RESUME;
+        END FOREACH;
+    ELSE
+        FOREACH
+            SELECT id, user_fp, sku, qty, interval_days, TRIM(TO_CHAR(unit_price)),
+                   status, next_bill_at, last_order_id, stripe_sub_id,
+                   TO_CHAR(created_at, '%Y-%m-%d %H:%M:%S.%F5'),
+                   TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+            INTO v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+                 v_status, v_next_bill, v_last_ord, v_stripe_sub,
+                 v_created_at, v_updated_at
+            FROM subscriptions
+            WHERE user_fp = p_user_fp
+            ORDER BY created_at DESC, id DESC
+
+            RETURN v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+                   v_status, v_next_bill, v_last_ord, v_stripe_sub,
+                   v_created_at, v_updated_at WITH RESUME;
+        END FOREACH;
+    END IF;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_get_subscription(p_id VARCHAR(64))
+    RETURNING
+        VARCHAR(64)  AS id,
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS sku,
+        INTEGER      AS qty,
+        INTEGER      AS interval_days,
+        VARCHAR(64)  AS unit_price,
+        VARCHAR(32)  AS status,
+        VARCHAR(64)  AS next_bill_at,
+        VARCHAR(64)  AS last_order_id,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS created_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_id         VARCHAR(64);
+    DEFINE v_user_fp    VARCHAR(128);
+    DEFINE v_sku        VARCHAR(32);
+    DEFINE v_qty        INTEGER;
+    DEFINE v_interval   INTEGER;
+    DEFINE v_unit_price VARCHAR(64);
+    DEFINE v_status     VARCHAR(32);
+    DEFINE v_next_bill  VARCHAR(64);
+    DEFINE v_last_ord   VARCHAR(64);
+    DEFINE v_stripe_sub VARCHAR(128);
+    DEFINE v_created_at VARCHAR(64);
+    DEFINE v_updated_at VARCHAR(64);
+
+    FOREACH
+        SELECT id, user_fp, sku, qty, interval_days, TRIM(TO_CHAR(unit_price)),
+               status, next_bill_at, last_order_id, stripe_sub_id,
+               TO_CHAR(created_at, '%Y-%m-%d %H:%M:%S.%F5'),
+               TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+        INTO v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+             v_status, v_next_bill, v_last_ord, v_stripe_sub,
+             v_created_at, v_updated_at
+        FROM subscriptions
+        WHERE id = p_id
+
+        RETURN v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+               v_status, v_next_bill, v_last_ord, v_stripe_sub,
+               v_created_at, v_updated_at WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_update_subscription(
+    p_id            VARCHAR(64),
+    p_status        VARCHAR(32),
+    p_next_bill_at  VARCHAR(64),
+    p_last_order_id VARCHAR(64)
+)
+    RETURNING
+        VARCHAR(64)  AS id,
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS sku,
+        INTEGER      AS qty,
+        INTEGER      AS interval_days,
+        VARCHAR(64)  AS unit_price,
+        VARCHAR(32)  AS status,
+        VARCHAR(64)  AS next_bill_at,
+        VARCHAR(64)  AS last_order_id,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS created_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_id         VARCHAR(64);
+    DEFINE v_user_fp    VARCHAR(128);
+    DEFINE v_sku        VARCHAR(32);
+    DEFINE v_qty        INTEGER;
+    DEFINE v_interval   INTEGER;
+    DEFINE v_unit_price VARCHAR(64);
+    DEFINE v_status     VARCHAR(32);
+    DEFINE v_next_bill  VARCHAR(64);
+    DEFINE v_last_ord   VARCHAR(64);
+    DEFINE v_stripe_sub VARCHAR(128);
+    DEFINE v_created_at VARCHAR(64);
+    DEFINE v_updated_at VARCHAR(64);
+
+    UPDATE subscriptions
+    SET status        = NVL(p_status, status),
+        next_bill_at  = NVL(p_next_bill_at, next_bill_at),
+        last_order_id = NVL(p_last_order_id, last_order_id),
+        updated_at    = CURRENT YEAR TO FRACTION(5)
+    WHERE id = p_id;
+
+    FOREACH
+        SELECT id, user_fp, sku, qty, interval_days, TRIM(TO_CHAR(unit_price)),
+               status, next_bill_at, last_order_id, stripe_sub_id,
+               TO_CHAR(created_at, '%Y-%m-%d %H:%M:%S.%F5'),
+               TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+        INTO v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+             v_status, v_next_bill, v_last_ord, v_stripe_sub,
+             v_created_at, v_updated_at
+        FROM subscriptions
+        WHERE id = p_id
+
+        RETURN v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+               v_status, v_next_bill, v_last_ord, v_stripe_sub,
+               v_created_at, v_updated_at WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_due_subscriptions(p_as_of_ts VARCHAR(64))
+    RETURNING
+        VARCHAR(64)  AS id,
+        VARCHAR(128) AS user_fp,
+        VARCHAR(32)  AS sku,
+        INTEGER      AS qty,
+        INTEGER      AS interval_days,
+        VARCHAR(64)  AS unit_price,
+        VARCHAR(32)  AS status,
+        VARCHAR(64)  AS next_bill_at,
+        VARCHAR(64)  AS last_order_id,
+        VARCHAR(128) AS stripe_sub_id,
+        VARCHAR(64)  AS created_at,
+        VARCHAR(64)  AS updated_at;
+
+    DEFINE v_as_of      VARCHAR(64);
+    DEFINE v_id         VARCHAR(64);
+    DEFINE v_user_fp    VARCHAR(128);
+    DEFINE v_sku        VARCHAR(32);
+    DEFINE v_qty        INTEGER;
+    DEFINE v_interval   INTEGER;
+    DEFINE v_unit_price VARCHAR(64);
+    DEFINE v_status     VARCHAR(32);
+    DEFINE v_next_bill  VARCHAR(64);
+    DEFINE v_last_ord   VARCHAR(64);
+    DEFINE v_stripe_sub VARCHAR(128);
+    DEFINE v_created_at VARCHAR(64);
+    DEFINE v_updated_at VARCHAR(64);
+
+    IF p_as_of_ts IS NULL OR p_as_of_ts = '' THEN
+        LET v_as_of = TO_CHAR(CURRENT YEAR TO SECOND, '%Y-%m-%d %H:%M:%S');
+    ELSE
+        LET v_as_of = p_as_of_ts;
+    END IF;
+
+    FOREACH
+        SELECT id, user_fp, sku, qty, interval_days, TRIM(TO_CHAR(unit_price)),
+               status, next_bill_at, last_order_id, stripe_sub_id,
+               TO_CHAR(created_at, '%Y-%m-%d %H:%M:%S.%F5'),
+               TO_CHAR(updated_at, '%Y-%m-%d %H:%M:%S.%F5')
+        INTO v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+             v_status, v_next_bill, v_last_ord, v_stripe_sub,
+             v_created_at, v_updated_at
+        FROM subscriptions
+        WHERE UPPER(status) = 'ACTIVE'
+          AND next_bill_at <> ''
+          AND next_bill_at <= v_as_of
+        ORDER BY next_bill_at ASC, id ASC
+
+        RETURN v_id, v_user_fp, v_sku, v_qty, v_interval, v_unit_price,
+               v_status, v_next_bill, v_last_ord, v_stripe_sub,
+               v_created_at, v_updated_at WITH RESUME;
+    END FOREACH;
+END PROCEDURE@
+
+CREATE OR REPLACE PROCEDURE shop_sp_subscription_metrics()
+    RETURNING
+        INTEGER     AS active_members,
+        INTEGER     AS active_subscriptions,
+        VARCHAR(64) AS membership_mrr,
+        VARCHAR(64) AS subscription_mrr;
+
+    DEFINE v_active_members INTEGER;
+    DEFINE v_active_subs    INTEGER;
+    DEFINE v_mem_mrr        DECIMAL(32,4);
+    DEFINE v_sub_mrr        DECIMAL(32,4);
+
+    SELECT COUNT(*), NVL(SUM(mt.monthly_price), 0.0000)
+    INTO v_active_members, v_mem_mrr
+    FROM memberships m
+    JOIN membership_tiers mt ON UPPER(mt.code) = UPPER(m.tier_code)
+    WHERE UPPER(m.status) = 'ACTIVE'
+      AND UPPER(m.tier_code) <> 'FREE';
+
+    SELECT COUNT(*), NVL(SUM((unit_price * qty * 30.0000) / interval_days), 0.0000)
+    INTO v_active_subs, v_sub_mrr
+    FROM subscriptions
+    WHERE UPPER(status) = 'ACTIVE';
+
+    RETURN v_active_members, v_active_subs,
+           TRIM(TO_CHAR(v_mem_mrr)), TRIM(TO_CHAR(v_sub_mrr)) WITH RESUME;
+END PROCEDURE@

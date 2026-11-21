@@ -61,9 +61,12 @@ sub calculate {
         };
     }
 
-    my $discount      = $zero;
-    my $promo_applied = undef;
-    my $promo_error   = undef;
+    my $discount        = $zero;
+    my $member_discount = $zero;
+    my $member_tier     = undef;
+    my $member_free_ship = 0;
+    my $promo_applied   = undef;
+    my $promo_error     = undef;
 
     if (my $promo = $opt{promo}) {
         my $min = dec($promo->{min_subtotal} // '0');
@@ -86,6 +89,25 @@ sub calculate {
         }
     }
 
+    if (ref($opt{membership}) eq 'HASH') {
+        my $mem = $opt{membership};
+        my $mem_active = !defined($mem->{status}) || uc($mem->{status}) eq 'ACTIVE';
+        if ($mem_active) {
+            my $pct = dec($mem->{discount_pct} // '0');
+            if ($pct > $zero && $count > 0) {
+                $member_discount = quant(($subtotal * $pct) / dec('100'));
+                $discount        = quant($discount + $member_discount);
+                if ($discount > $subtotal) {
+                    $discount = $subtotal;
+                }
+            }
+            if ($mem->{free_shipping}) {
+                $member_free_ship = 1;
+            }
+            $member_tier = $mem->{tier_code} if defined $mem->{tier_code} && length $mem->{tier_code};
+        }
+    }
+
     my $taxable  = quant($subtotal - $discount);
     my ($tax_rate, $tax, $nexus_status);
     if (ref($opt{tax_result}) eq 'HASH') {
@@ -103,7 +125,15 @@ sub calculate {
     }
 
     my ($free_shipping, $shipping, $shipping_carrier, $shipping_service);
-    if (ref($opt{shipping_rate}) eq 'HASH' && defined $opt{shipping_rate}{amount}) {
+    if ($member_free_ship) {
+        $shipping      = $zero;
+        $free_shipping = 1;
+        if (ref($opt{shipping_rate}) eq 'HASH') {
+            $shipping_carrier = $opt{shipping_rate}{carrier};
+            $shipping_service = $opt{shipping_rate}{service};
+        }
+    }
+    elsif (ref($opt{shipping_rate}) eq 'HASH' && defined $opt{shipping_rate}{amount}) {
         $shipping         = $count > 0 ? quant($opt{shipping_rate}{amount}) : $zero;
         $free_shipping    = ($shipping == $zero) ? 1 : 0;
         $shipping_carrier = $opt{shipping_rate}{carrier};
@@ -125,6 +155,8 @@ sub calculate {
     return {
         subtotal         => $subtotal,
         discount         => $discount,
+        member_discount  => $member_discount,
+        member_tier      => $member_tier,
         tax              => $tax,
         tax_rate         => $tax_rate,
         nexus_status     => $nexus_status,

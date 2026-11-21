@@ -953,3 +953,256 @@ BEGIN
         ORDER BY tn.state ASC;
     OPEN cur;
 END@
+
+-- =========================================================================
+-- Memberships and Recurring Subscriptions (SP_ONLY)
+-- =========================================================================
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_LIST_MEMBERSHIP_TIERS()
+    LANGUAGE SQL
+    READS SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT code, name, monthly_price, discount_pct,
+               free_shipping, priority_fulfillment, active
+        FROM membership_tiers
+        WHERE active = 1
+        ORDER BY monthly_price ASC, code ASC;
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_GET_MEMBERSHIP(
+    IN p_user_fp VARCHAR(128)
+)
+    LANGUAGE SQL
+    READS SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT user_fp, tier_code, status, stripe_sub_id,
+               VARCHAR(started_at) AS started_at,
+               renews_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM memberships
+        WHERE user_fp = p_user_fp;
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_UPSERT_MEMBERSHIP(
+    IN p_user_fp       VARCHAR(128),
+    IN p_tier_code     VARCHAR(32),
+    IN p_status        VARCHAR(32),
+    IN p_stripe_sub_id VARCHAR(128),
+    IN p_renews_at     VARCHAR(64)
+)
+    LANGUAGE SQL
+    MODIFIES SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT user_fp, tier_code, status, stripe_sub_id,
+               VARCHAR(started_at) AS started_at,
+               renews_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM memberships
+        WHERE user_fp = p_user_fp;
+
+    MERGE INTO memberships AS t
+    USING (
+        VALUES (p_user_fp, p_tier_code, p_status, p_stripe_sub_id, p_renews_at)
+    ) AS s (user_fp, tier_code, status, stripe_sub_id, renews_at)
+    ON t.user_fp = s.user_fp
+    WHEN MATCHED THEN
+        UPDATE SET
+            tier_code     = COALESCE(s.tier_code, t.tier_code),
+            status        = COALESCE(s.status, t.status),
+            stripe_sub_id = COALESCE(s.stripe_sub_id, t.stripe_sub_id),
+            renews_at     = COALESCE(s.renews_at, t.renews_at),
+            updated_at    = CURRENT TIMESTAMP
+    WHEN NOT MATCHED THEN
+        INSERT (user_fp, tier_code, status, stripe_sub_id, renews_at)
+        VALUES (
+            s.user_fp,
+            COALESCE(s.tier_code, 'FREE'),
+            COALESCE(s.status, 'ACTIVE'),
+            COALESCE(s.stripe_sub_id, ''),
+            COALESCE(s.renews_at, '')
+        );
+
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_CREATE_SUBSCRIPTION(
+    IN p_id            VARCHAR(64),
+    IN p_user_fp       VARCHAR(128),
+    IN p_sku           VARCHAR(32),
+    IN p_qty           INTEGER,
+    IN p_interval_days INTEGER,
+    IN p_unit_price    DECFLOAT(34),
+    IN p_next_bill_at  VARCHAR(64),
+    IN p_stripe_sub_id VARCHAR(128)
+)
+    LANGUAGE SQL
+    MODIFIES SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT id, user_fp, sku, qty, interval_days, unit_price, status,
+               next_bill_at, last_order_id, stripe_sub_id,
+               VARCHAR(created_at) AS created_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM FINAL TABLE (
+            INSERT INTO subscriptions (
+                id, user_fp, sku, qty, interval_days, unit_price,
+                status, next_bill_at, last_order_id, stripe_sub_id
+            ) VALUES (
+                p_id, p_user_fp, p_sku, p_qty, p_interval_days, p_unit_price,
+                'ACTIVE',
+                COALESCE(p_next_bill_at, ''),
+                '',
+                COALESCE(p_stripe_sub_id, '')
+            )
+        );
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_LIST_SUBSCRIPTIONS(
+    IN p_user_fp VARCHAR(128)
+)
+    LANGUAGE SQL
+    READS SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur_all CURSOR WITH RETURN TO CLIENT FOR
+        SELECT id, user_fp, sku, qty, interval_days, unit_price, status,
+               next_bill_at, last_order_id, stripe_sub_id,
+               VARCHAR(created_at) AS created_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM subscriptions
+        ORDER BY created_at DESC, id DESC;
+    DECLARE cur_user CURSOR WITH RETURN TO CLIENT FOR
+        SELECT id, user_fp, sku, qty, interval_days, unit_price, status,
+               next_bill_at, last_order_id, stripe_sub_id,
+               VARCHAR(created_at) AS created_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM subscriptions
+        WHERE user_fp = p_user_fp
+        ORDER BY created_at DESC, id DESC;
+
+    IF p_user_fp IS NULL OR p_user_fp = '' THEN
+        OPEN cur_all;
+    ELSE
+        OPEN cur_user;
+    END IF;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_GET_SUBSCRIPTION(
+    IN p_id VARCHAR(64)
+)
+    LANGUAGE SQL
+    READS SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT id, user_fp, sku, qty, interval_days, unit_price, status,
+               next_bill_at, last_order_id, stripe_sub_id,
+               VARCHAR(created_at) AS created_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM subscriptions
+        WHERE id = p_id;
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_UPDATE_SUBSCRIPTION(
+    IN p_id            VARCHAR(64),
+    IN p_status        VARCHAR(32),
+    IN p_next_bill_at  VARCHAR(64),
+    IN p_last_order_id VARCHAR(64)
+)
+    LANGUAGE SQL
+    MODIFIES SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT id, user_fp, sku, qty, interval_days, unit_price, status,
+               next_bill_at, last_order_id, stripe_sub_id,
+               VARCHAR(created_at) AS created_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM FINAL TABLE (
+            UPDATE subscriptions
+            SET status        = COALESCE(p_status, status),
+                next_bill_at  = COALESCE(p_next_bill_at, next_bill_at),
+                last_order_id = COALESCE(p_last_order_id, last_order_id),
+                updated_at    = CURRENT TIMESTAMP
+            WHERE id = p_id
+        );
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_DUE_SUBSCRIPTIONS(
+    IN p_as_of_ts VARCHAR(64)
+)
+    LANGUAGE SQL
+    READS SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE v_as_of VARCHAR(64);
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT id, user_fp, sku, qty, interval_days, unit_price, status,
+               next_bill_at, last_order_id, stripe_sub_id,
+               VARCHAR(created_at) AS created_at,
+               VARCHAR(updated_at) AS updated_at
+        FROM subscriptions
+        WHERE UPPER(status) = 'ACTIVE'
+          AND next_bill_at <> ''
+          AND next_bill_at <= v_as_of
+        ORDER BY next_bill_at ASC, id ASC;
+
+    IF p_as_of_ts IS NULL OR p_as_of_ts = '' THEN
+        SET v_as_of = VARCHAR_FORMAT(CURRENT TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS');
+    ELSE
+        SET v_as_of = p_as_of_ts;
+    END IF;
+    OPEN cur;
+END@
+
+CREATE OR REPLACE PROCEDURE SHOP_SP_SUBSCRIPTION_METRICS()
+    LANGUAGE SQL
+    READS SQL DATA
+    DYNAMIC RESULT SETS 1
+BEGIN
+    DECLARE v_active_members INTEGER      DEFAULT 0;
+    DECLARE v_active_subs    INTEGER      DEFAULT 0;
+    DECLARE v_mem_mrr        DECFLOAT(34) DEFAULT 0;
+    DECLARE v_sub_mrr        DECFLOAT(34) DEFAULT 0;
+
+    DECLARE cur CURSOR WITH RETURN TO CLIENT FOR
+        SELECT v_active_members AS active_members,
+               v_active_subs    AS active_subscriptions,
+               v_mem_mrr        AS membership_mrr,
+               v_sub_mrr        AS subscription_mrr
+        FROM SYSIBM.SYSDUMMY1;
+
+    SELECT COUNT(*),
+           COALESCE(SUM(CAST(mt.monthly_price AS DECIMAL(31,4))), DECIMAL(0, 31, 4))
+    INTO v_active_members, v_mem_mrr
+    FROM memberships m
+    JOIN membership_tiers mt ON UPPER(mt.code) = UPPER(m.tier_code)
+    WHERE UPPER(m.status) = 'ACTIVE'
+      AND UPPER(m.tier_code) <> 'FREE';
+
+    SELECT COUNT(*),
+           COALESCE(
+               SUM(
+                   (CAST(unit_price AS DECFLOAT(34)) * CAST(qty AS DECFLOAT(34)) * CAST(30 AS DECFLOAT(34)))
+                   / CAST(interval_days AS DECFLOAT(34))
+               ),
+               CAST(0 AS DECFLOAT(34))
+           )
+    INTO v_active_subs, v_sub_mrr
+    FROM subscriptions
+    WHERE UPPER(status) = 'ACTIVE';
+
+    OPEN cur;
+END@

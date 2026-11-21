@@ -88,6 +88,32 @@ sub startup {
         });
     });
 
+    $r->get('/api/memberships' => sub {
+        my ($c) = @_;
+        my @tiers;
+        if (my $db = $self->db) {
+            if ($db->can('list_membership_tiers')) {
+                my $rows = eval { $db->list_membership_tiers } || [];
+                for my $t (@$rows) {
+                    push @tiers, {
+                        code                 => $t->{code} // '',
+                        name                 => $t->{name} // '',
+                        monthly_price        => defined $t->{monthly_price} ? "$t->{monthly_price}" : '0.00',
+                        discount_pct         => defined $t->{discount_pct}  ? "$t->{discount_pct}"  : '0.00',
+                        free_shipping        => $t->{free_shipping}        ? Mojo::JSON::true : Mojo::JSON::false,
+                        priority_fulfillment => $t->{priority_fulfillment} ? Mojo::JSON::true : Mojo::JSON::false,
+                        active               => (!defined $t->{active} || $t->{active}) ? Mojo::JSON::true : Mojo::JSON::false,
+                    };
+                }
+            }
+        }
+        $c->render(json => {
+            ok    => Mojo::JSON::true,
+            count => scalar(@tiers),
+            tiers => \@tiers,
+        });
+    });
+
     $r->post('/webhooks/stripe' => sub {
         my ($c) = @_;
         my $body    = $c->req->body // '';
@@ -113,6 +139,15 @@ sub startup {
         my $event_id = $ev->{id};
         if (!$self->_check_and_mark_idempotent($event_id)) {
             return $c->render(json => { ok => Mojo::JSON::true, duplicate => Mojo::JSON::true });
+        }
+
+        if (my $sub_res = Shop::Webhook::Server::_handle_stripe_subscription_event(
+            $ev, $self->db, $self->event_bus, $self->metrics
+        )) {
+            return $c->render(json => {
+                ok => Mojo::JSON::true,
+                %$sub_res,
+            });
         }
 
         my $obj = ($ev->{data} && ref($ev->{data}) eq 'HASH' && ref($ev->{data}{object}) eq 'HASH')

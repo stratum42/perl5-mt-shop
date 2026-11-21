@@ -141,3 +141,43 @@ CREATE INDEX IF NOT EXISTS idx_po_lines_po ON po_lines (po_id);
 CREATE INDEX IF NOT EXISTS idx_shipments_order ON shipments (order_id);
 CREATE INDEX IF NOT EXISTS idx_shipments_tracking ON shipments (tracking_number);
 CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments (status);
+
+-- Memberships and Recurring Subscriptions
+
+CREATE TABLE IF NOT EXISTS membership_tiers (
+    code                 TEXT PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    monthly_price        TEXT NOT NULL DEFAULT '0.0000',
+    discount_pct         TEXT NOT NULL DEFAULT '0.0000',
+    free_shipping        INTEGER NOT NULL DEFAULT 0,
+    priority_fulfillment INTEGER NOT NULL DEFAULT 0,
+    active               INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+    user_fp       TEXT PRIMARY KEY,
+    tier_code     TEXT NOT NULL DEFAULT 'FREE',
+    status        TEXT NOT NULL DEFAULT 'ACTIVE',
+    stripe_sub_id TEXT NOT NULL DEFAULT '',
+    started_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    renews_at     TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id            TEXT PRIMARY KEY,
+    user_fp       TEXT NOT NULL,
+    sku           TEXT NOT NULL,
+    qty           INTEGER NOT NULL CHECK (qty > 0),
+    interval_days INTEGER NOT NULL CHECK (interval_days >= 7),
+    unit_price    TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'ACTIVE',
+    next_bill_at  TEXT NOT NULL DEFAULT '',
+    last_order_id TEXT NOT NULL DEFAULT '',
+    stripe_sub_id TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions (user_fp);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_status_due ON subscriptions (status, next_bill_at);

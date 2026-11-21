@@ -237,3 +237,62 @@ CREATE INDEX idx_shipments_order    ON shipments (order_id);
 CREATE INDEX idx_shipments_tracking ON shipments (tracking_number);
 CREATE INDEX idx_shipments_status   ON shipments (status);
 CREATE INDEX idx_shipments_aud_id   ON shipments_audit (id, sys_start);
+
+-- Memberships and Recurring Subscriptions (+ SPL trigger audit)
+
+CREATE TABLE membership_tiers (
+    code                 VARCHAR(32)                   NOT NULL PRIMARY KEY,
+    name                 VARCHAR(128)                  NOT NULL,
+    monthly_price        DECIMAL(32,4)  DEFAULT 0.0000 NOT NULL,
+    discount_pct         DECIMAL(16,4)  DEFAULT 0.0000 NOT NULL,
+    free_shipping        SMALLINT       DEFAULT 0      NOT NULL,
+    priority_fulfillment SMALLINT       DEFAULT 0      NOT NULL,
+    active               SMALLINT       DEFAULT 1      NOT NULL
+);
+
+CREATE TABLE memberships (
+    user_fp       VARCHAR(128)                    NOT NULL PRIMARY KEY,
+    tier_code     VARCHAR(32)   DEFAULT 'FREE'    NOT NULL,
+    status        VARCHAR(32)   DEFAULT 'ACTIVE'  NOT NULL,
+    stripe_sub_id VARCHAR(128)  DEFAULT ''        NOT NULL,
+    started_at    DATETIME YEAR TO FRACTION(5) DEFAULT CURRENT YEAR TO FRACTION(5) NOT NULL,
+    renews_at     VARCHAR(64)   DEFAULT ''        NOT NULL,
+    updated_at    DATETIME YEAR TO FRACTION(5) DEFAULT CURRENT YEAR TO FRACTION(5) NOT NULL
+);
+
+CREATE TABLE subscriptions (
+    id            VARCHAR(64)                    NOT NULL PRIMARY KEY,
+    user_fp       VARCHAR(128)                   NOT NULL,
+    sku           VARCHAR(32)                    NOT NULL,
+    qty           INTEGER                        NOT NULL,
+    interval_days INTEGER                        NOT NULL,
+    unit_price    DECIMAL(32,4)                  NOT NULL,
+    status        VARCHAR(32)   DEFAULT 'ACTIVE' NOT NULL,
+    next_bill_at  VARCHAR(64)   DEFAULT ''       NOT NULL,
+    last_order_id VARCHAR(64)   DEFAULT ''       NOT NULL,
+    stripe_sub_id VARCHAR(128)  DEFAULT ''       NOT NULL,
+    created_at    DATETIME YEAR TO FRACTION(5) DEFAULT CURRENT YEAR TO FRACTION(5) NOT NULL,
+    updated_at    DATETIME YEAR TO FRACTION(5) DEFAULT CURRENT YEAR TO FRACTION(5) NOT NULL,
+    CHECK (qty > 0) CONSTRAINT chk_subscriptions_qty,
+    CHECK (interval_days >= 7) CONSTRAINT chk_subscriptions_int
+);
+
+CREATE TABLE subscriptions_audit (
+    audit_id      SERIAL                        NOT NULL PRIMARY KEY,
+    id            VARCHAR(64)                   NOT NULL,
+    user_fp       VARCHAR(128)                  NOT NULL,
+    sku           VARCHAR(32)                   NOT NULL,
+    qty           INTEGER                       NOT NULL,
+    interval_days INTEGER                       NOT NULL,
+    unit_price    DECIMAL(32,4)                 NOT NULL,
+    status        VARCHAR(32)                   NOT NULL,
+    next_bill_at  VARCHAR(64)                   NOT NULL,
+    last_order_id VARCHAR(64)                   NOT NULL,
+    op            CHAR(1)                       NOT NULL,
+    sys_start     DATETIME YEAR TO FRACTION(5)  NOT NULL,
+    sys_end       DATETIME YEAR TO FRACTION(5)  NOT NULL
+);
+
+CREATE INDEX idx_subscriptions_user       ON subscriptions (user_fp);
+CREATE INDEX idx_subscriptions_status_due ON subscriptions (status, next_bill_at);
+CREATE INDEX idx_subscriptions_aud_id     ON subscriptions_audit (id, sys_start);

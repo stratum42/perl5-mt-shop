@@ -213,3 +213,11 @@ INSERT INTO tax_nexus (state, rate, threshold_sales, threshold_txns, registered)
 INSERT INTO tax_nexus (state, rate, threshold_sales, threshold_txns, registered) VALUES ('WA', 0.0650,  100000.0000,   0, 0);
 INSERT INTO tax_nexus (state, rate, threshold_sales, threshold_txns, registered) VALUES ('FL', 0.0600,  100000.0000,   0, 0);
 INSERT INTO tax_nexus (state, rate, threshold_sales, threshold_txns, registered) VALUES ('IL', 0.0625,  100000.0000, 200, 0);
+
+-- 3 Membership Tiers
+INSERT INTO membership_tiers (code, name, monthly_price, discount_pct, free_shipping, priority_fulfillment, active) VALUES
+('FREE',    'Standard',   0.00,  0.00, 0, 0, 1);
+INSERT INTO membership_tiers (code, name, monthly_price, discount_pct, free_shipping, priority_fulfillment, active) VALUES
+('PRO',     'Pro Member', 9.99, 10.00, 1, 1, 1);
+INSERT INTO membership_tiers (code, name, monthly_price, discount_pct, free_shipping, priority_fulfillment, active) VALUES
+('FOUNDER', 'Founder',   24.99, 20.00, 1, 1, 1);

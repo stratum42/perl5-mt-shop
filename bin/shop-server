@@ -66,6 +66,8 @@ use Shop::State::EventBus;
 use Shop::Domain::Pricing;
 use Shop::Domain::Cart;
 use Shop::Domain::Checkout;
+use Shop::Domain::Membership;
+use Shop::Domain::Subscription;
 use Shop::Payment::Mock;
 use Shop::Payment::Stripe;
 
@@ -79,6 +81,7 @@ use Shop::TUI::View::Checkout;
 use Shop::TUI::View::Orders;
 use Shop::TUI::View::Account;
 use Shop::TUI::View::Admin;
+use Shop::TUI::View::Subscriptions;
 
 # ---------------------------------------------------------------------------
 # Worker entrypoints (named subs in frozen image)
@@ -125,11 +128,14 @@ sub checkpoint_worker {
 }
 
 sub reaper_worker {
-    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $shutdown_id) = @_;
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
     my $cfg      = _decode_cfg($cfg_blob);
-    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id });
+    my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
+    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
     my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
     my $shutdown = MT::Cell->attach($shutdown_id);
+    my $db       = Shop::DB->new($cfg->{db});
+    my $hostkey  = Shop::SSH::Wire::load_or_generate_hostkey($cfg->{ssh}{host_key} // 'config/host_ed25519_key');
 
     my $kdb = eval {
         my $k = Shop::Cache::KeyDB->new(
@@ -140,10 +146,49 @@ sub reaper_worker {
         $k->ping() ? $k : undef;
     };
 
+    my $stripe_key = $cfg->{stripe}{secret_key} // $ENV{STRIPE_SECRET_KEY} // '';
+    my $payment    = length($stripe_key)
+        ? Shop::Payment::Stripe->new(secret_key => $stripe_key)
+        : Shop::Payment::Mock->new();
+
+    my $membership = Shop::Domain::Membership->new(
+        db        => $db,
+        event_bus => $eb,
+        metrics   => $metrics,
+    );
+    my $checkout = Shop::Domain::Checkout->new(
+        db         => $db,
+        inventory  => $inv,
+        event_bus  => $eb,
+        keydb      => $kdb,
+        payment    => $payment,
+        hostkey    => $hostkey,
+        metrics    => $metrics,
+        membership => $membership,
+    );
+    my $subscription = Shop::Domain::Subscription->new(
+        db         => $db,
+        inventory  => $inv,
+        checkout   => $checkout,
+        membership => $membership,
+        keydb      => $kdb,
+        event_bus  => $eb,
+        metrics    => $metrics,
+    );
+
+    my $renew_interval = $cfg->{workers}{renewal_interval_sec} // 60;
+    my $next_renew_at  = time() + $renew_interval;
+
     while (!$shutdown->get()) {
         MT::Supervisor::beat();
         if ($kdb) {
             eval { $kdb->ping() };
+        }
+        my $now = time();
+        if ($now >= $next_renew_at) {
+            eval { $subscription->process_due_renewals() };
+            warn "[reaper] renewal tick error: $@" if $@;
+            $next_renew_at = $now + $renew_interval;
         }
         usleep(200_000); # 200ms
     }
@@ -262,29 +307,46 @@ sub session_worker {
                             db        => $db,
                             lease_ttl => $cfg->{workers}{lease_ttl_sec} // 900,
                         );
-                        my $checkout = Shop::Domain::Checkout->new(
+                        my $membership = Shop::Domain::Membership->new(
                             db        => $db,
-                            inventory => $inv,
                             event_bus => $eb,
-                            keydb     => $kdb,
-                            payment   => $payment,
-                            hostkey   => $hostkey,
                             metrics   => $metrics,
+                        );
+                        my $checkout = Shop::Domain::Checkout->new(
+                            db         => $db,
+                            inventory  => $inv,
+                            event_bus  => $eb,
+                            keydb      => $kdb,
+                            payment    => $payment,
+                            hostkey    => $hostkey,
+                            metrics    => $metrics,
+                            membership => $membership,
+                        );
+                        my $subscription = Shop::Domain::Subscription->new(
+                            db         => $db,
+                            inventory  => $inv,
+                            checkout   => $checkout,
+                            membership => $membership,
+                            keydb      => $kdb,
+                            event_bus  => $eb,
+                            metrics    => $metrics,
                         );
 
                         my $app = Shop::TUI::App->new(
-                            session    => $sess,
-                            session_id => "w${worker_idx}-fd${client_fd}-" . int(time() * 1000),
-                            config     => $cfg,
-                            db         => $db,
-                            keydb      => $kdb,
-                            inventory  => $inv,
-                            event_bus  => $eb,
-                            metrics    => $metrics,
-                            hostkey    => $hostkey,
-                            cart       => $cart,
-                            checkout   => $checkout,
-                            user       => $user,
+                            session      => $sess,
+                            session_id   => "w${worker_idx}-fd${client_fd}-" . int(time() * 1000),
+                            config       => $cfg,
+                            db           => $db,
+                            keydb        => $kdb,
+                            inventory    => $inv,
+                            event_bus    => $eb,
+                            metrics      => $metrics,
+                            hostkey      => $hostkey,
+                            cart         => $cart,
+                            checkout     => $checkout,
+                            membership   => $membership,
+                            subscription => $subscription,
+                            user         => $user,
                         );
                         $app->run();
                     };
@@ -420,7 +482,8 @@ push @workers, MT::Worker::spawn(
 );
 push @workers, MT::Worker::spawn(
     'Shop::Server::reaper_worker',
-    $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id}, $eb_ids->{sessions_id}, $shutdown_cell->id
+    $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id},
+    $eb_ids->{sessions_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
 );
 
 my $ops_port = defined($cfg->{ops}{port}) ? int($cfg->{ops}{port}) : 8088;
@@ -469,7 +532,7 @@ $SIG{PIPE} = 'IGNORE';
 
 $| = 1;
 my $ops_msg = $ops_port > 0
-    ? "http://$ops_host:$ops_port (/healthz, /metrics, /api/catalog, /webhooks/stripe, /webhooks/shippo)"
+    ? "http://$ops_host:$ops_port (/healthz, /metrics, /api/catalog, /api/memberships, /webhooks/stripe, /webhooks/shippo)"
     : "disabled";
 print "[shop-server] Listening on ssh://$listen_host:$listen_port "
     . "(db=" . $db->driver() . ", products=$loaded, session_workers=$n_sess, kex=mlkem768x25519-sha256, compression=zlib\@openssh.com, ops=$ops_msg)\n";

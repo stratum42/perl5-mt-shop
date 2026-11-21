@@ -251,3 +251,54 @@ CREATE INDEX idx_shipments_order    ON shipments (order_id);
 CREATE INDEX idx_shipments_tracking ON shipments (tracking_number);
 CREATE INDEX idx_shipments_status   ON shipments (status);
 CREATE INDEX idx_shipments_hist_id  ON shipments_history (id, sys_start DESC);
+
+-- Memberships and Recurring Subscriptions (SYSTEM_TIME temporal versioning)
+
+CREATE TABLE membership_tiers (
+    code                 VARCHAR(32)  NOT NULL PRIMARY KEY,
+    name                 VARCHAR(128) NOT NULL,
+    monthly_price        DECFLOAT(34) NOT NULL DEFAULT 0.0000,
+    discount_pct         DECFLOAT(34) NOT NULL DEFAULT 0.0000,
+    free_shipping        SMALLINT     NOT NULL DEFAULT 0,
+    priority_fulfillment SMALLINT     NOT NULL DEFAULT 0,
+    active               SMALLINT     NOT NULL DEFAULT 1
+);
+
+CREATE TABLE memberships (
+    user_fp       VARCHAR(128) NOT NULL PRIMARY KEY,
+    tier_code     VARCHAR(32)  NOT NULL DEFAULT 'FREE',
+    status        VARCHAR(32)  NOT NULL DEFAULT 'ACTIVE',
+    stripe_sub_id VARCHAR(128) NOT NULL DEFAULT '',
+    started_at    TIMESTAMP    NOT NULL DEFAULT CURRENT TIMESTAMP,
+    renews_at     VARCHAR(64)  NOT NULL DEFAULT '',
+    updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT TIMESTAMP
+);
+
+CREATE TABLE subscriptions (
+    id            VARCHAR(64)   NOT NULL PRIMARY KEY,
+    user_fp       VARCHAR(128)  NOT NULL,
+    sku           VARCHAR(32)   NOT NULL,
+    qty           INTEGER       NOT NULL,
+    interval_days INTEGER       NOT NULL,
+    unit_price    DECFLOAT(34)  NOT NULL,
+    status        VARCHAR(32)   NOT NULL DEFAULT 'ACTIVE',
+    next_bill_at  VARCHAR(64)   NOT NULL DEFAULT '',
+    last_order_id VARCHAR(64)   NOT NULL DEFAULT '',
+    stripe_sub_id VARCHAR(128)  NOT NULL DEFAULT '',
+    created_at    TIMESTAMP     NOT NULL DEFAULT CURRENT TIMESTAMP,
+    updated_at    TIMESTAMP     NOT NULL DEFAULT CURRENT TIMESTAMP,
+    sys_start     TIMESTAMP(12) GENERATED ALWAYS AS ROW BEGIN NOT NULL,
+    sys_end       TIMESTAMP(12) GENERATED ALWAYS AS ROW END NOT NULL,
+    trans_start   TIMESTAMP(12) GENERATED ALWAYS AS TRANSACTION START ID IMPLICITLY HIDDEN,
+    PERIOD SYSTEM_TIME (sys_start, sys_end),
+    CONSTRAINT chk_subscriptions_qty CHECK (qty > 0),
+    CONSTRAINT chk_subscriptions_int CHECK (interval_days >= 7)
+) COMPRESS YES ADAPTIVE;
+
+CREATE TABLE subscriptions_history LIKE subscriptions;
+ALTER TABLE subscriptions_history COMPRESS YES ADAPTIVE;
+ALTER TABLE subscriptions ADD VERSIONING USE HISTORY TABLE subscriptions_history;
+
+CREATE INDEX idx_subscriptions_user       ON subscriptions (user_fp);
+CREATE INDEX idx_subscriptions_status_due ON subscriptions (status, next_bill_at);
+CREATE INDEX idx_subscriptions_hist_id    ON subscriptions_history (id, sys_start DESC);

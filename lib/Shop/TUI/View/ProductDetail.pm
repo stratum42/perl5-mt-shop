@@ -26,7 +26,42 @@ sub on_enter {
 sub is_capturing_text { 0 }
 
 sub help_text {
-    return "[+/- or Left/Right] Qty | [a/Enter] Add to Cart (CAS) | [c] View Cart | [Esc/b] Back";
+    return "[+/- or Left/Right] Qty | [a/Enter] Add to Cart (CAS) | [S] Subscribe (30d) | [c] View Cart | [Esc/b] Back";
+}
+
+sub _subscribe_30d {
+    my ($self, $app) = @_;
+    return unless defined $self->{sku};
+    my $mgr = $app->can('subscription_mgr') ? $app->subscription_mgr() : $app->{subscription};
+    if (!$mgr || !$mgr->can('create')) {
+        $app->set_toast("Subscription service unavailable.", 'err');
+        return;
+    }
+    my $res = eval {
+        $mgr->create(
+            user_fp       => $app->user_fp(),
+            sku           => $self->{sku},
+            qty           => $self->{qty},
+            interval_days => 30,
+        );
+    };
+    if ($@) {
+        $app->set_toast("Subscribe failed: $@", 'err');
+        return;
+    }
+    if (ref($res) eq 'HASH' && exists($res->{ok}) && !$res->{ok}) {
+        $app->set_toast($res->{error} // "Subscribe failed.", 'err');
+        return;
+    }
+    my $sub = (ref($res) eq 'HASH' && ref($res->{subscription}) eq 'HASH') ? $res->{subscription} : $res;
+    my $id  = (ref($sub) eq 'HASH' && $sub->{id}) ? $sub->{id} : 'OK';
+    my $prc = (ref($sub) eq 'HASH' && defined $sub->{unit_price})
+        ? ('$' . $app->format_money($sub->{unit_price}))
+        : '';
+    my $msg = "Subscribed: $self->{qty}x $self->{sku} every 30d"
+            . (length($prc) ? " ($prc)" : '')
+            . " [$id]";
+    $app->set_toast($msg, 'ok', 5.0);
 }
 
 sub handle_key {
@@ -60,6 +95,10 @@ sub handle_key {
             $self->{qty} = 1 if $self->{qty} > $rem;
             $self->{qty} = 1 if $self->{qty} < 1;
         }
+        return 1;
+    }
+    if ($type eq 'CHAR' && lc($ch) eq 's') {
+        $self->_subscribe_30d($app);
         return 1;
     }
     if ($type eq 'CHAR' && lc($ch) eq 'c') {
@@ -130,7 +169,14 @@ sub draw {
     if ($ctrl_y < $y + $h - 1) {
         $scr->write_str($rx, $ctrl_y, sprintf("Quantity: [-]  %2d  [+]", $self->{qty}), $pal->{key}, $rw);
         if ($live_stock > 0) {
-            $scr->write_str($rx, $ctrl_y + 2, " [A] Add to Cart (Atomic CAS Lease) ", $pal->{tab_act}, $rw);
+            my $add_lbl = " [A] Add to Cart (CAS) ";
+            my $sub_lbl = " [S] Subscribe (30d) ";
+            $scr->write_str($rx, $ctrl_y + 2, $add_lbl, $pal->{tab_act}, $rw);
+            if ($rw >= length($add_lbl) + 2 + length($sub_lbl)) {
+                $scr->write_str($rx + length($add_lbl) + 2, $ctrl_y + 2, $sub_lbl, $pal->{ok}, $rw - length($add_lbl) - 2);
+            } elsif ($ctrl_y + 3 < $y + $h - 1) {
+                $scr->write_str($rx, $ctrl_y + 3, $sub_lbl, $pal->{ok}, $rw);
+            }
         } else {
             $scr->write_str($rx, $ctrl_y + 2, " Unavailable - Out of Stock ", $pal->{err}, $rw);
         }

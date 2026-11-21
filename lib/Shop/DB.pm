@@ -912,4 +912,167 @@ sub tax_nexus_report {
     return \@report;
 }
 
+# --- Memberships and Recurring Subscriptions ---
+
+sub list_membership_tiers {
+    my ($self) = @_;
+    return $self->query(
+        'SELECT code, name, monthly_price, discount_pct, free_shipping, priority_fulfillment, active '
+      . 'FROM membership_tiers WHERE active = 1 ORDER BY CAST(monthly_price AS REAL) ASC, code ASC'
+    );
+}
+
+sub get_membership {
+    my ($self, $fp) = @_;
+    return undef unless defined $fp && length $fp;
+    my $rows = $self->query(
+        'SELECT user_fp, tier_code, status, stripe_sub_id, started_at, renews_at, updated_at '
+      . 'FROM memberships WHERE user_fp = ?',
+        $fp
+    );
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub upsert_membership {
+    my ($self, $m) = @_;
+    $m ||= {};
+    my $fp = $m->{user_fp} or die "upsert_membership: user_fp required\n";
+    my $existing = $self->get_membership($fp);
+    if ($existing) {
+        $self->exec(
+            "UPDATE memberships SET tier_code = ?, status = ?, stripe_sub_id = ?, renews_at = ?, updated_at = datetime('now') WHERE user_fp = ?",
+            defined($m->{tier_code})     ? "$m->{tier_code}"     : $existing->{tier_code},
+            defined($m->{status})        ? "$m->{status}"        : $existing->{status},
+            defined($m->{stripe_sub_id}) ? "$m->{stripe_sub_id}" : $existing->{stripe_sub_id},
+            defined($m->{renews_at})     ? "$m->{renews_at}"     : $existing->{renews_at},
+            $fp,
+        );
+    }
+    else {
+        $self->exec(
+            'INSERT INTO memberships (user_fp, tier_code, status, stripe_sub_id, renews_at) VALUES (?, ?, ?, ?, ?)',
+            $fp,
+            $m->{tier_code}     // 'FREE',
+            $m->{status}        // 'ACTIVE',
+            $m->{stripe_sub_id} // '',
+            $m->{renews_at}     // '',
+        );
+    }
+    return $self->get_membership($fp);
+}
+
+sub create_subscription {
+    my ($self, $s) = @_;
+    $s ||= {};
+    die "create_subscription: user_fp and sku required\n"
+        unless defined $s->{user_fp} && length $s->{user_fp}
+            && defined $s->{sku}     && length $s->{sku};
+    my $id = $s->{id} || sprintf('SUB-%d-%04d', time(), int(rand(10000)));
+    $self->exec(
+        'INSERT INTO subscriptions (id, user_fp, sku, qty, interval_days, unit_price, status, next_bill_at, last_order_id, stripe_sub_id) '
+      . 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        $id,
+        "$s->{user_fp}",
+        "$s->{sku}",
+        int($s->{qty}           // 1),
+        int($s->{interval_days} // 30),
+        defined($s->{unit_price}) ? "$s->{unit_price}" : '0.0000',
+        'ACTIVE',
+        $s->{next_bill_at}  // '',
+        '',
+        $s->{stripe_sub_id} // '',
+    );
+    return $self->get_subscription($id);
+}
+
+sub list_subscriptions {
+    my ($self, $fp) = @_;
+    my $cols = 'id, user_fp, sku, qty, interval_days, unit_price, status, next_bill_at, last_order_id, stripe_sub_id, created_at, updated_at';
+    if (defined $fp && length $fp) {
+        return $self->query(
+            "SELECT $cols FROM subscriptions WHERE user_fp = ? ORDER BY created_at DESC, id DESC",
+            $fp
+        );
+    }
+    return $self->query(
+        "SELECT $cols FROM subscriptions ORDER BY created_at DESC, id DESC"
+    );
+}
+
+sub get_subscription {
+    my ($self, $id) = @_;
+    return undef unless defined $id && length $id;
+    my $rows = $self->query(
+        'SELECT id, user_fp, sku, qty, interval_days, unit_price, status, next_bill_at, last_order_id, stripe_sub_id, created_at, updated_at '
+      . 'FROM subscriptions WHERE id = ?',
+        $id
+    );
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub update_subscription {
+    my ($self, $id, @rest) = @_;
+    return undef unless defined $id && length $id;
+    my %fields = (@rest == 1 && ref($rest[0]) eq 'HASH') ? %{ $rest[0] } : @rest;
+    my $status        = exists $fields{status}        ? $fields{status}        : undef;
+    my $next_bill_at  = exists $fields{next_bill_at}  ? $fields{next_bill_at}  : undef;
+    my $last_order_id = exists $fields{last_order_id} ? $fields{last_order_id} : undef;
+
+    $self->exec(
+        "UPDATE subscriptions SET "
+      . "status = COALESCE(?, status), "
+      . "next_bill_at = COALESCE(?, next_bill_at), "
+      . "last_order_id = COALESCE(?, last_order_id), "
+      . "updated_at = datetime('now') "
+      . "WHERE id = ?",
+        $status, $next_bill_at, $last_order_id, $id
+    );
+    return $self->get_subscription($id);
+}
+
+sub due_subscriptions {
+    my ($self, $as_of_ts) = @_;
+    my $ts = (defined $as_of_ts && length $as_of_ts) ? "$as_of_ts" : $self->current_timestamp();
+    return $self->query(
+        "SELECT id, user_fp, sku, qty, interval_days, unit_price, status, next_bill_at, last_order_id, stripe_sub_id, created_at, updated_at "
+      . "FROM subscriptions "
+      . "WHERE UPPER(status) = 'ACTIVE' AND next_bill_at <> '' AND next_bill_at <= ? "
+      . "ORDER BY next_bill_at ASC, id ASC",
+        $ts
+    );
+}
+
+sub subscription_metrics {
+    my ($self) = @_;
+    my $mem_rows = $self->query(
+        "SELECT mt.monthly_price AS monthly_price "
+      . "FROM memberships m "
+      . "JOIN membership_tiers mt ON UPPER(mt.code) = UPPER(m.tier_code) "
+      . "WHERE UPPER(m.status) = 'ACTIVE' AND UPPER(m.tier_code) <> 'FREE'"
+    );
+    my $mem_mrr = MT::Decimal->new('0.00');
+    for my $r (@$mem_rows) {
+        $mem_mrr = $mem_mrr + MT::Decimal->new('' . ($r->{monthly_price} // '0'));
+    }
+
+    my $sub_rows = $self->query(
+        "SELECT unit_price, qty, interval_days FROM subscriptions WHERE UPPER(status) = 'ACTIVE'"
+    );
+    my $sub_mrr = MT::Decimal->new('0.00');
+    my $thirty  = MT::Decimal->new('30');
+    for my $r (@$sub_rows) {
+        my $price = MT::Decimal->new('' . ($r->{unit_price} // '0'));
+        my $qty   = MT::Decimal->new('' . int($r->{qty} // 1));
+        my $days  = MT::Decimal->new('' . int($r->{interval_days} // 30));
+        $sub_mrr  = $sub_mrr + (($price * $qty * $thirty) / $days);
+    }
+
+    return {
+        active_members       => scalar(@$mem_rows),
+        active_subscriptions => scalar(@$sub_rows),
+        membership_mrr       => '' . $mem_mrr->quantize(-2, MT::Decimal::ROUND_HALF_UP),
+        subscription_mrr     => '' . $sub_mrr->quantize(-2, MT::Decimal::ROUND_HALF_UP),
+    };
+}
+
 1;

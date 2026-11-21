@@ -23,15 +23,16 @@ sub new {
     die "Shop::Domain::Checkout: db required\n"        unless $opt{db};
     die "Shop::Domain::Checkout: inventory required\n" unless $opt{inventory};
     return bless {
-        db        => $opt{db},
-        inventory => $opt{inventory},
-        event_bus => $opt{event_bus},
-        keydb     => $opt{keydb},
-        payment   => $opt{payment} // Shop::Payment::Mock->new,
-        hostkey   => $opt{hostkey},
-        metrics   => $opt{metrics},
-        shippo    => $opt{shippo},
-        tax_nexus => $opt{tax_nexus},
+        db         => $opt{db},
+        inventory  => $opt{inventory},
+        event_bus  => $opt{event_bus},
+        keydb      => $opt{keydb},
+        payment    => $opt{payment} // Shop::Payment::Mock->new,
+        hostkey    => $opt{hostkey},
+        metrics    => $opt{metrics},
+        shippo     => $opt{shippo},
+        tax_nexus  => $opt{tax_nexus},
+        membership => $opt{membership},
     }, $class;
 }
 
@@ -159,13 +160,29 @@ sub place_order {
     my $items = $cart->items;
     return { ok => 0, error => 'Cart is empty' } unless @$items;
 
+    my $member_benefits;
+    if (ref($args{membership}) eq 'HASH') {
+        $member_benefits = $args{membership};
+    }
+    elsif ($args{membership} && eval { $args{membership}->can('benefits') }) {
+        $member_benefits = $args{membership}->benefits($user->{fingerprint});
+    }
+    elsif ($self->{membership} && eval { $self->{membership}->can('benefits') }
+           && defined $user->{fingerprint} && $user->{fingerprint} ne 'guest') {
+        $member_benefits = $self->{membership}->benefits($user->{fingerprint});
+    }
+
     my $totals;
     my $tax_nexus     = $args{tax_nexus} // $self->{tax_nexus};
     my $shipping_rate = $args{shipping_rate};
-    if ($tax_nexus || $shipping_rate) {
-        my $base    = Shop::Domain::Pricing::calculate($items, promo => $cart->promo);
+    if ($tax_nexus || $shipping_rate || $member_benefits) {
+        my %base_opt = (
+            promo => $cart->promo,
+            ($member_benefits ? (membership => $member_benefits) : ()),
+        );
+        my $base    = Shop::Domain::Pricing::calculate($items, %base_opt);
         my $taxable = Shop::Domain::Pricing::quant($base->{subtotal} - $base->{discount});
-        my %p_opt   = (promo => $cart->promo);
+        my %p_opt   = %base_opt;
         if ($tax_nexus && ref($args{address}) eq 'HASH' && defined $args{address}{state} && length $args{address}{state}) {
             $p_opt{tax_result} = $tax_nexus->calculate(
                 state       => $args{address}{state},
@@ -409,6 +426,7 @@ sub quick_reorder {
         payment        => $args{payment},
         payment_method => $args{payment_method},
         hostkey        => $args{hostkey},
+        (defined $args{membership} ? (membership => $args{membership}) : ()),
     );
 
     if (!$res->{ok}) {

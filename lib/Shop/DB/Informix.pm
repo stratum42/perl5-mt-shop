@@ -632,6 +632,105 @@ sub tax_nexus_report {
     return $self->sp_call('SHOP_SP_TAX_NEXUS_REPORT');
 }
 
+# --- Memberships and Recurring Subscriptions (SP_ONLY) ---
+
+sub list_membership_tiers {
+    my ($self) = @_;
+    return $self->sp_call('SHOP_SP_LIST_MEMBERSHIP_TIERS');
+}
+
+sub get_membership {
+    my ($self, $fp) = @_;
+    return undef unless defined $fp && length $fp;
+    my $rows = $self->sp_call('SHOP_SP_GET_MEMBERSHIP', "$fp");
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub upsert_membership {
+    my ($self, $m) = @_;
+    $m ||= {};
+    my $fp = $m->{user_fp} or die "upsert_membership: user_fp required\n";
+    my $rows = $self->sp_call(
+        'SHOP_SP_UPSERT_MEMBERSHIP',
+        "$fp",
+        defined($m->{tier_code})     ? "$m->{tier_code}"     : undef,
+        defined($m->{status})        ? "$m->{status}"        : undef,
+        defined($m->{stripe_sub_id}) ? "$m->{stripe_sub_id}" : undef,
+        defined($m->{renews_at})     ? "$m->{renews_at}"     : undef,
+    );
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub create_subscription {
+    my ($self, $s) = @_;
+    $s ||= {};
+    die "create_subscription: user_fp and sku required\n"
+        unless defined $s->{user_fp} && length $s->{user_fp}
+            && defined $s->{sku}     && length $s->{sku};
+    my $id = $s->{id} || sprintf('SUB-%d-%04d', time(), int(rand(10000)));
+    my $rows = $self->sp_call(
+        'SHOP_SP_CREATE_SUBSCRIPTION',
+        "$id",
+        "$s->{user_fp}",
+        "$s->{sku}",
+        int($s->{qty}           // 1),
+        int($s->{interval_days} // 30),
+        defined($s->{unit_price}) ? "$s->{unit_price}" : '0.0000',
+        $s->{next_bill_at}  // '',
+        $s->{stripe_sub_id} // '',
+    );
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub list_subscriptions {
+    my ($self, $fp) = @_;
+    return $self->sp_call('SHOP_SP_LIST_SUBSCRIPTIONS', defined($fp) ? "$fp" : '');
+}
+
+sub get_subscription {
+    my ($self, $id) = @_;
+    return undef unless defined $id && length $id;
+    my $rows = $self->sp_call('SHOP_SP_GET_SUBSCRIPTION', "$id");
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub update_subscription {
+    my ($self, $id, @rest) = @_;
+    return undef unless defined $id && length $id;
+    my %fields = (@rest == 1 && ref($rest[0]) eq 'HASH') ? %{ $rest[0] } : @rest;
+    my $status        = exists $fields{status}        ? $fields{status}        : undef;
+    my $next_bill_at  = exists $fields{next_bill_at}  ? $fields{next_bill_at}  : undef;
+    my $last_order_id = exists $fields{last_order_id} ? $fields{last_order_id} : undef;
+
+    my $rows = $self->sp_call(
+        'SHOP_SP_UPDATE_SUBSCRIPTION',
+        "$id",
+        defined($status)        ? "$status"        : undef,
+        defined($next_bill_at)  ? "$next_bill_at"  : undef,
+        defined($last_order_id) ? "$last_order_id" : undef,
+    );
+    return @$rows ? $rows->[0] : undef;
+}
+
+sub due_subscriptions {
+    my ($self, $as_of_ts) = @_;
+    return $self->sp_call('SHOP_SP_DUE_SUBSCRIPTIONS', defined($as_of_ts) ? "$as_of_ts" : '');
+}
+
+sub subscription_metrics {
+    my ($self) = @_;
+    my $rows = $self->sp_call('SHOP_SP_SUBSCRIPTION_METRICS');
+    my $r = @$rows ? $rows->[0] : {};
+    my $mem_mrr = MT::Decimal->new('' . ($r->{membership_mrr}   // '0'))->quantize(-2, MT::Decimal::ROUND_HALF_UP);
+    my $sub_mrr = MT::Decimal->new('' . ($r->{subscription_mrr} // '0'))->quantize(-2, MT::Decimal::ROUND_HALF_UP);
+    return {
+        active_members       => int($r->{active_members}       // 0),
+        active_subscriptions => int($r->{active_subscriptions} // 0),
+        membership_mrr       => "$mem_mrr",
+        subscription_mrr     => "$sub_mrr",
+    };
+}
+
 package Shop::DB::Informix::Tx;
 use strict;
 use warnings;

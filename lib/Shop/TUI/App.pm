@@ -29,6 +29,7 @@ my %VIEW_CLASSES = (
     orders         => 'Shop::TUI::View::Orders',
     account        => 'Shop::TUI::View::Account',
     admin          => 'Shop::TUI::View::Admin',
+    subscriptions  => 'Shop::TUI::View::Subscriptions',
 );
 
 my $DEFAULT_PALETTE = {
@@ -97,8 +98,11 @@ sub new {
         checkout     => $args{checkout},
         shippo       => $args{shippo},
         tax_nexus    => $args{tax_nexus},
+        membership   => $args{membership},
+        subscription => $args{subscription},
         user         => $user,
         inbox        => $args{inbox},
+        _member_tier => '',
 
         screen       => Shop::TUI::Screen->new(cols => $cols, rows => $rows, env => $env),
         input        => Shop::TUI::Input->new(),
@@ -123,8 +127,9 @@ sub new {
 
     # Load / upsert user record in DB if available
     $self->_init_user_record();
+    $self->refresh_membership();
     $self->_restore_session_state();
-    $self->{views}{ $self->{active_view} }->on_enter($self);
+    $self->_view($self->{active_view})->on_enter($self);
 
     return $self;
 }
@@ -231,6 +236,64 @@ sub tax_nexus {
     return $self->{tax_nexus};
 }
 
+sub membership_mgr {
+    my ($self) = @_;
+    return $self->{membership} if $self->{membership};
+    if (eval { require Shop::Domain::Membership; 1 }) {
+        $self->{membership} = eval {
+            Shop::Domain::Membership->new(
+                db        => $self->{db},
+                event_bus => $self->{event_bus},
+                metrics   => $self->{metrics},
+            );
+        };
+    }
+    return $self->{membership};
+}
+
+sub subscription_mgr {
+    my ($self) = @_;
+    return $self->{subscription} if $self->{subscription};
+    if (eval { require Shop::Domain::Subscription; 1 }) {
+        $self->{subscription} = eval {
+            Shop::Domain::Subscription->new(
+                db         => $self->{db},
+                inventory  => $self->{inventory},
+                checkout   => $self->{checkout},
+                membership => $self->membership_mgr(),
+                keydb      => $self->{keydb},
+                event_bus  => $self->{event_bus},
+                metrics    => $self->{metrics},
+            );
+        };
+    }
+    return $self->{subscription};
+}
+
+sub refresh_membership {
+    my ($self) = @_;
+    my $fp = $self->user_fp();
+    my $m;
+    if ($self->{membership} && $self->{membership}->can('get_membership')) {
+        $m = eval { $self->{membership}->get_membership($fp) };
+    } elsif ($self->{db} && $self->{db}->can('get_membership')) {
+        $m = eval { $self->{db}->get_membership($fp) };
+    }
+    if (ref($m) eq 'HASH' && uc($m->{status} // '') eq 'ACTIVE') {
+        my $tc = uc($m->{tier_code} // '');
+        $self->{_member_tier} = ($tc eq 'PRO' || $tc eq 'FOUNDER') ? $tc : '';
+    } else {
+        $self->{_member_tier} = '';
+    }
+    return $self->{_member_tier};
+}
+
+sub active_member_badge {
+    my ($self) = @_;
+    my $tc = $self->{_member_tier} // '';
+    return ($tc eq 'PRO' || $tc eq 'FOUNDER') ? "[$tc]" : '';
+}
+
 sub has_quick_reorder {
     my ($self) = @_;
     return 0 unless $self->{db};
@@ -273,7 +336,15 @@ sub set_toast {
 sub _view {
     my ($self, $name) = @_;
     return undef unless defined $name && exists $VIEW_CLASSES{$name};
-    return $self->{views}{$name} ||= $VIEW_CLASSES{$name}->new();
+    if (!$self->{views}{$name}) {
+        my $cls = $VIEW_CLASSES{$name};
+        if (!$cls->can('new')) {
+            (my $mod = "$cls.pm") =~ s{::}{/}g;
+            require $mod;
+        }
+        $self->{views}{$name} = $cls->new();
+    }
+    return $self->{views}{$name};
 }
 
 sub switch_view {
@@ -407,6 +478,37 @@ sub handle_event {
         }
         $self->set_toast("Stripe payment confirmed live for Order #$oid!", 'ok', 6.0);
         $self->{dirty} = 1;
+    } elsif ($t eq 'membership_updated') {
+        my $tier = uc($ev->{tier_code} // 'FREE');
+        my $st   = uc($ev->{status}    // 'ACTIVE');
+        if ($st eq 'ACTIVE' && ($tier eq 'PRO' || $tier eq 'FOUNDER')) {
+            $self->{_member_tier} = $tier;
+        } else {
+            $self->{_member_tier} = '';
+        }
+        $self->{ticker_msg} = "[MEMBERSHIP] Plan $tier is now $st";
+        $self->set_toast("Membership updated: $tier ($st)", ($st eq 'ACTIVE' ? 'ok' : 'warn'), 6.0);
+        if ($self->{active_view} eq 'subscriptions' && $self->{views}{subscriptions}) {
+            $self->{views}{subscriptions}->refresh($self);
+        } elsif ($self->{active_view} eq 'admin' && $self->{views}{admin}) {
+            $self->{views}{admin}->refresh($self);
+        }
+        $self->{dirty} = 1;
+    } elsif ($t eq 'subscription_renewed') {
+        my $sid = $ev->{sub_id}   // '';
+        my $oid = $ev->{order_id} // '';
+        my $sku = $ev->{sku}      // '';
+        my $tot = $self->format_money($ev->{total} // 0);
+        $self->{ticker_msg} = "[SUB RENEWED] $sid ($sku) -> Order #$oid (\$$tot)";
+        $self->set_toast("Subscription $sid renewed: Order #$oid (\$$tot)", 'ok', 6.0);
+        if ($self->{active_view} eq 'subscriptions' && $self->{views}{subscriptions}) {
+            $self->{views}{subscriptions}->refresh($self);
+        } elsif ($self->{active_view} eq 'orders' && $self->{views}{orders}) {
+            $self->{views}{orders}->refresh($self);
+        } elsif ($self->{active_view} eq 'admin' && $self->{views}{admin}) {
+            $self->{views}{admin}->refresh($self);
+        }
+        $self->{dirty} = 1;
     } elsif ($t eq 'broadcast') {
         my $msg = $ev->{message} // '';
         my $who = $ev->{from}    // 'admin';
@@ -453,11 +555,13 @@ sub handle_key {
             $self->{running} = 0;
             return 1;
         }
-        if ($ch eq '1') { $self->switch_view('catalog'); return 1; }
-        if ($ch eq '2') { $self->switch_view('cart');    return 1; }
-        if ($ch eq '3') { $self->switch_view('orders');  return 1; }
-        if ($ch eq '4') { $self->switch_view('account'); return 1; }
-        if ($ch eq '5') { $self->switch_view('admin');   return 1; }
+        my $in_subs = ($self->{active_view} eq 'subscriptions');
+        if (!$in_subs && $ch eq '1') { $self->switch_view('catalog'); return 1; }
+        if (!$in_subs && $ch eq '2') { $self->switch_view('cart');    return 1; }
+        if (!$in_subs && $ch eq '3') { $self->switch_view('orders');  return 1; }
+        if ($ch eq '4') { $self->switch_view('account');       return 1; }
+        if ($ch eq '5') { $self->switch_view('admin');         return 1; }
+        if ($ch eq '8') { $self->switch_view('subscriptions'); return 1; }
     }
 
     my $changed = $view->handle_key($self, $ev);
@@ -511,43 +615,50 @@ sub render_frame {
     my $cart_tot = $self->{cart} ? $self->format_money(($self->{cart}->totals() || {})->{total}) : '0.00';
 
     my @nav = (
-        [ 'catalog', '[1]Shop' ],
-        [ 'cart',    "[2]Cart($cart_cnt)" ],
-        [ 'orders',  '[3]Orders' ],
-        [ 'account', '[4]Acct' ],
+        [ 'catalog',       '[1]Shop' ],
+        [ 'cart',          "[2]Cart($cart_cnt)" ],
+        [ 'orders',        '[3]Orders' ],
+        [ 'account',       '[4]Acct' ],
+        [ 'subscriptions', '[8]Subs' ],
     );
     push @nav, [ 'admin', '[5]Admin' ] if $self->is_admin();
 
+    my $mem_badge = $self->active_member_badge();
     my ($kex_tag, $eff_tag, $is_pq) = $self->_security_pill();
     my $pill_str  = "$kex_tag$eff_tag";
     my $right_tot = " \$$cart_tot ";
-    my $reserve_r = length($pill_str) + length($right_tot) + 1;
+    my $compact   = ($cols < 100) ? 1 : 0;
 
     my @hitboxes;
-    my $nx = 11;
+    my $nx = $compact ? 10 : 11;
     for my $item (@nav) {
         my ($vname, $lbl) = @$item;
         my $act = ($self->{active_view} eq $vname || ($vname eq 'catalog' && $self->{active_view} eq 'product_detail'));
-        my $tab_str = " $lbl ";
+        my $tab_str = $compact ? "$lbl " : " $lbl ";
         my $tw = length($tab_str);
-        last if $nx + $tw > $cols - 10;
+        last if $nx + $tw > $cols - length($right_tot);
         $scr->write_str($nx, 0, $tab_str, $act ? $pal->{tab_act} : $pal->{tab_inact});
         push @hitboxes, { view => $vname, x0 => $nx, x1 => $nx + $tw };
         $nx += $tw;
     }
     $self->{_nav_hitboxes} = \@hitboxes;
 
-    # Right side of header: [PQ:MLKEM768][ZLIB:-98%][CAS] + $total
+    # Right side of header: [PRO]/[FOUNDER] + [PQ:MLKEM768][ZLIB:-98%][CAS] + $total
     my $rx_tot = $cols - length($right_tot);
     if ($rx_tot > $nx) {
         $scr->write_str($rx_tot, 0, $right_tot, $pal->{header_accent});
     }
-    my $rx_pill = $rx_tot - length($pill_str);
+    my $rx_cur = $rx_tot;
+    if (length($mem_badge) && ($rx_cur - length($mem_badge) - 1) >= $nx) {
+        $rx_cur -= length($mem_badge);
+        $scr->write_str($rx_cur, 0, $mem_badge, $pal->{header_accent});
+    }
+    my $rx_pill = $rx_cur - length($pill_str);
     if ($rx_pill > $nx) {
         $scr->write_str($rx_pill, 0, $kex_tag, $is_pq ? $pal->{pq_badge} : $pal->{header_accent});
         $scr->write_str($rx_pill + length($kex_tag), 0, $eff_tag, $pal->{eff_badge});
-    } elsif ($rx_tot - length($kex_tag) > $nx) {
-        $scr->write_str($rx_tot - length($kex_tag), 0, $kex_tag, $is_pq ? $pal->{pq_badge} : $pal->{header_accent});
+    } elsif ($rx_cur - length($kex_tag) > $nx) {
+        $scr->write_str($rx_cur - length($kex_tag), 0, $kex_tag, $is_pq ? $pal->{pq_badge} : $pal->{header_accent});
     }
 
     # --- Row 1: Broadcast / Toast / Divider ---

@@ -565,4 +565,258 @@ like($ord_frame, qr/\[DAL1\]/,     "Orders detail displays shipment warehouse DA
 like($ord_frame, qr/IN_TRANSIT/,   "Orders detail displays live shipment status IN_TRANSIT");
 like($ord_frame, qr/Track #:/,     "Orders detail displays shipment tracking number");
 
+# --- 7. Memberships & Subscriptions TUI view, [8]Subs nav, ProductDetail [S], Header badge, Admin MRR ---
+{
+    package MockSubsDB;
+    sub new {
+        my ($c) = @_;
+        return bless {
+            tiers => [
+                { code => 'FREE',    name => 'Standard',   monthly_price => '0.00',  discount_pct => '0.00',  free_shipping => 0, priority_fulfillment => 0, active => 1 },
+                { code => 'PRO',     name => 'Pro Member', monthly_price => '9.99',  discount_pct => '10.00', free_shipping => 1, priority_fulfillment => 1, active => 1 },
+                { code => 'FOUNDER', name => 'Founder',    monthly_price => '24.99', discount_pct => '20.00', free_shipping => 1, priority_fulfillment => 1, active => 1 },
+            ],
+            membership => {
+                user_fp   => 'SHA256:admin',
+                tier_code => 'FREE',
+                status    => 'ACTIVE',
+                renews_at => '',
+            },
+            subs => [
+                {
+                    id            => 'SUB-2026-0001',
+                    user_fp       => 'SHA256:admin',
+                    sku           => 'SKU-001',
+                    qty           => 1,
+                    interval_days => 30,
+                    unit_price    => '89.99',
+                    status        => 'ACTIVE',
+                    next_bill_at  => '2026-12-21 00:00:00',
+                    last_order_id => '',
+                },
+            ],
+            next_id => 2,
+        }, $c;
+    }
+    sub driver { 'sqlite' }
+    sub get_user { undef }
+    sub upsert_user { $_[1] }
+    sub list_orders { [] }
+    sub gmv_summary { { order_count => 0, total_gmv => '0.00' } }
+    sub list_membership_tiers { $_[0]->{tiers} }
+    sub get_membership { $_[0]->{membership} }
+    sub upsert_membership {
+        my ($self, $m) = @_;
+        $self->{membership} = {
+            user_fp   => $m->{user_fp}   // 'SHA256:admin',
+            tier_code => uc($m->{tier_code} // 'FREE'),
+            status    => uc($m->{status}    // 'ACTIVE'),
+            renews_at => $m->{renews_at} // '2026-12-21 00:00:00',
+        };
+        return $self->{membership};
+    }
+    sub list_subscriptions { $_[0]->{subs} }
+    sub subscription_metrics {
+        return {
+            active_members       => 3,
+            active_subscriptions => 5,
+            membership_mrr       => '44.97',
+            subscription_mrr     => '125.50',
+        };
+    }
+
+    package MockMembershipMgr;
+    sub new { my ($c, %a) = @_; bless \%a, $c }
+    sub list_tiers     { $_[0]->{db}->list_membership_tiers() }
+    sub get_membership { $_[0]->{db}->get_membership($_[1]) }
+    sub enroll {
+        my ($self, %a) = @_;
+        my $row = $self->{db}->upsert_membership({
+            user_fp   => $a{user_fp},
+            tier_code => $a{tier_code},
+            status    => 'ACTIVE',
+        });
+        return { ok => 1, membership => $row };
+    }
+    sub cancel {
+        my ($self, %a) = @_;
+        my $cur = $self->{db}->get_membership($a{user_fp}) || { tier_code => 'FREE' };
+        my $row = $self->{db}->upsert_membership({
+            user_fp   => $a{user_fp},
+            tier_code => $cur->{tier_code},
+            status    => 'CANCELED',
+        });
+        return { ok => 1, membership => $row };
+    }
+
+    package MockSubscriptionMgr;
+    sub new { my ($c, %a) = @_; bless \%a, $c }
+    sub list_user { $_[0]->{db}->list_subscriptions($_[1]) }
+    sub create {
+        my ($self, %a) = @_;
+        my $id = sprintf('SUB-2026-%04d', $self->{db}{next_id}++);
+        my $row = {
+            id            => $id,
+            user_fp       => $a{user_fp},
+            sku           => $a{sku},
+            qty           => $a{qty} // 1,
+            interval_days => $a{interval_days} // 30,
+            unit_price    => '99.99',
+            status        => 'ACTIVE',
+            next_bill_at  => '2026-12-21 00:00:00',
+            last_order_id => '',
+        };
+        push @{ $self->{db}{subs} }, $row;
+        return { ok => 1, subscription => $row };
+    }
+    sub _find {
+        my ($self, $id) = @_;
+        my ($s) = grep { $_->{id} eq $id } @{ $self->{db}{subs} };
+        return $s;
+    }
+    sub pause {
+        my ($self, $id) = @_;
+        my $s = $self->_find($id);
+        $s->{status} = 'PAUSED' if $s;
+        return { ok => 1, subscription => $s };
+    }
+    sub resume {
+        my ($self, $id) = @_;
+        my $s = $self->_find($id);
+        $s->{status} = 'ACTIVE' if $s;
+        return { ok => 1, subscription => $s };
+    }
+    sub skip_next {
+        my ($self, $id) = @_;
+        my $s = $self->_find($id);
+        $s->{next_bill_at} = '2027-01-20 00:00:00' if $s;
+        return { ok => 1, subscription => $s };
+    }
+    sub cancel {
+        my ($self, $id) = @_;
+        my $s = $self->_find($id);
+        $s->{status} = 'CANCELED' if $s;
+        return { ok => 1, subscription => $s };
+    }
+
+    package MockSubsInv;
+    sub new { bless {}, shift }
+    sub list_catalog {
+        return [
+            { sku => 'SKU-001', name => 'MT5 Server', category => 'Hardware', price => '99.99', stock => 7, description => 'Rack server' },
+        ];
+    }
+    sub get_product {
+        my ($self, $sku) = @_;
+        return { sku => $sku, name => 'MT5 Server', category => 'Hardware', price => '99.99', stock => 7, description => 'Rack server', ascii_art => '[MT5]' };
+    }
+    sub get_stock { 7 }
+}
+
+my $subs_db  = MockSubsDB->new();
+my $mem_mgr  = MockMembershipMgr->new(db => $subs_db);
+my $sub_mgr  = MockSubscriptionMgr->new(db => $subs_db);
+my $subs_inv = MockSubsInv->new();
+
+my $subs_app = Shop::TUI::App->new(
+    cols         => 118,
+    rows         => 28,
+    db           => $subs_db,
+    inventory    => $subs_inv,
+    membership   => $mem_mgr,
+    subscription => $sub_mgr,
+    config       => { admin_fingerprints => ['*'] },
+    user         => { username => 'admin', fingerprint => 'SHA256:admin', is_admin => 1 },
+);
+
+# [8]Subs tab present in Row 0 and clickable via SGR mouse
+$subs_app->render_frame();
+my $cat_txt = _screen_text($subs_app->{screen});
+like($cat_txt, qr/\[8\]Subs/, "Header renders [8]Subs navigation tab");
+ok(!exists($subs_app->{views}{subscriptions}), "Subscriptions view is lazy-loaded");
+
+my ($subs_hb) = grep { $_->{view} eq 'subscriptions' } @{ $subs_app->{_nav_hitboxes} };
+ok($subs_hb, "[8]Subs SGR mouse hitbox populated");
+$subs_app->handle_key({ type => 'MOUSE', button => 'left', press => 1, x => $subs_hb->{x0} + 1, y => 0 });
+is($subs_app->{active_view}, 'subscriptions', "SGR mouse click on [8]Subs switches to subscriptions view");
+ok(exists($subs_app->{views}{subscriptions}), "Subscriptions view instantiated on demand");
+
+# Switch back to catalog and test key '8'
+$subs_app->switch_view('catalog');
+$subs_app->handle_key({ type => 'CHAR', char => '8' });
+is($subs_app->{active_view}, 'subscriptions', "Key '8' switches to subscriptions view");
+
+$subs_app->render_frame();
+my $subs_txt = _screen_text($subs_app->{screen});
+like($subs_txt, qr/PRO\s+\$ 9\.99\/mo\s+10% off\s+\+ free ship/,     "Subscriptions top pane renders PRO tier");
+like($subs_txt, qr/FOUNDER\s+\$24\.99\/mo\s+20% off\s+\+ free ship/, "Subscriptions top pane renders FOUNDER tier");
+like($subs_txt, qr/SUB-2026-0001/,                                   "Subscriptions bottom pane renders subscription id");
+like($subs_txt, qr/every 30d/,                                       "Subscriptions bottom pane renders cadence");
+
+# Enroll PRO via [2], verify header [PRO] badge
+$subs_app->handle_key({ type => 'CHAR', char => '2' });
+is($subs_db->{membership}{tier_code}, 'PRO', "Key '2' in Subscriptions view enrolls PRO tier");
+$subs_app->render_frame();
+my $pro_hdr = _screen_text($subs_app->{screen});
+like($pro_hdr, qr/\[PRO\]/, "Header displays [PRO] badge for active PRO member");
+
+# Upgrade PRO -> FOUNDER via [u], verify header [FOUNDER] badge
+$subs_app->handle_key({ type => 'CHAR', char => 'u' });
+is($subs_db->{membership}{tier_code}, 'FOUNDER', "Key 'u' upgrades PRO -> FOUNDER");
+$subs_app->render_frame();
+my $fdr_hdr = _screen_text($subs_app->{screen});
+like($fdr_hdr, qr/\[FOUNDER\]/, "Header displays [FOUNDER] badge for active FOUNDER member");
+
+# Pause [p], Resume [p], Skip [k], Cancel [c] on recurring subscription
+$subs_app->handle_key({ type => 'CHAR', char => 'p' });
+is($subs_db->{subs}[0]{status}, 'PAUSED', "Key 'p' pauses active subscription");
+$subs_app->handle_key({ type => 'CHAR', char => 'p' });
+is($subs_db->{subs}[0]{status}, 'ACTIVE', "Key 'p' resumes paused subscription");
+$subs_app->handle_key({ type => 'CHAR', char => 'k' });
+is($subs_db->{subs}[0]{next_bill_at}, '2027-01-20 00:00:00', "Key 'k' skips next delivery");
+$subs_app->handle_key({ type => 'CHAR', char => 'c' });
+is($subs_db->{subs}[0]{status}, 'CANCELED', "Key 'c' cancels selected subscription");
+
+# Cancel membership via [x], verify header badge clears
+$subs_app->handle_key({ type => 'CHAR', char => 'x' });
+is($subs_db->{membership}{status}, 'CANCELED', "Key 'x' cancels membership");
+is($subs_app->active_member_badge(), '', "Header badge cleared after membership cancel");
+
+# ProductDetail [S] Subscribe (30d)
+$subs_app->open_product_detail('SKU-001');
+$subs_app->render_frame();
+my $pd_txt = _screen_text($subs_app->{screen});
+like($pd_txt, qr/\[S\] Subscribe \(30d\)/, "ProductDetail renders [S] Subscribe (30d) action");
+$subs_app->handle_key({ type => 'CHAR', char => 'S' });
+is(scalar(@{ $subs_db->{subs} }), 2, "Key 'S' in ProductDetail creates new recurring subscription");
+like($subs_app->{toast_msg}, qr/Subscribed: 1x SKU-001 every 30d/, "ProductDetail [S] shows confirmation toast");
+
+# Live EventBus pushes: membership_updated & subscription_renewed
+$subs_app->handle_event({
+    type      => 'membership_updated',
+    user_fp   => 'SHA256:admin',
+    tier_code => 'PRO',
+    status    => 'ACTIVE',
+});
+is($subs_app->active_member_badge(), '[PRO]', "membership_updated push updates header badge to [PRO]");
+like($subs_app->{toast_msg},  qr/Membership updated: PRO \(ACTIVE\)/, "membership_updated push sets toast");
+like($subs_app->{ticker_msg}, qr/\[MEMBERSHIP\] Plan PRO is now ACTIVE/, "membership_updated push updates ticker");
+
+$subs_app->handle_event({
+    type     => 'subscription_renewed',
+    sub_id   => 'SUB-2026-0002',
+    order_id => 'ORD-9001',
+    sku      => 'SKU-001',
+    total    => '89.99',
+});
+like($subs_app->{toast_msg},  qr/Subscription SUB-2026-0002 renewed: Order #ORD-9001/, "subscription_renewed push sets toast");
+like($subs_app->{ticker_msg}, qr/\[SUB RENEWED\] SUB-2026-0002/, "subscription_renewed push updates ticker");
+
+# Admin Dashboard displays active members, active subscriptions, and exact MT::Decimal MRR
+$subs_app->switch_view('admin');
+$subs_app->render_frame();
+my $adm_txt = _screen_text($subs_app->{screen});
+like($adm_txt, qr/3 members \| 5 active subs \| MRR: \$170\.47 \(Mem \$44\.97 \+ Sub \$125\.50\)/,
+    "Admin Dashboard renders active members, active subs, and exact MT::Decimal MRR");
+
 done_testing();

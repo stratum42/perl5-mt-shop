@@ -2,6 +2,7 @@ package Shop::TUI::View::Admin;
 
 use strict;
 use warnings;
+use MT::Decimal ();
 use Shop::TUI::Input ();
 
 my @SUBTABS = ('Dashboard', 'Inventory', 'Orders', '[T] Db2 Time-Travel & OLAP', '[L] Logistics & Nexus', 'Broadcast');
@@ -37,6 +38,7 @@ sub new {
         edit_mode     => '',    # '' | 'stock' | 'price' | 'broadcast' | 'po_scan'
         edit_buf      => '',
         gmv           => {},
+        sub_metrics   => {},
         db2_features  => {},
         prod_history  => [],
         ord_history   => [],
@@ -123,6 +125,12 @@ sub refresh {
         $self->{orders} = ref($ords) eq 'ARRAY' ? $ords : [];
         my $gmv = eval { $app->{db}->gmv_summary() };
         $self->{gmv} = ref($gmv) eq 'HASH' ? $gmv : {};
+        if ($app->{db}->can('subscription_metrics')) {
+            my $sm = eval { $app->{db}->subscription_metrics() };
+            $self->{sub_metrics} = ref($sm) eq 'HASH' ? $sm : {};
+        } else {
+            $self->{sub_metrics} = {};
+        }
     }
     $self->_refresh_db2($app);
     $self->_refresh_logistics($app);
@@ -661,6 +669,16 @@ sub _draw_dashboard {
     my $gmv_tot = $app->format_money($self->{gmv}{total_gmv} // $self->{gmv}{gmv} // '0.00');
     my $gmv_cnt = $self->{gmv}{order_count} // $self->{gmv}{orders} // ($gm->{orders_total} // 0);
 
+    my $subm      = $self->{sub_metrics} || {};
+    my $act_mem   = int($subm->{active_members}       // 0);
+    my $act_subs  = int($subm->{active_subscriptions} // 0);
+    my $mem_mrr_d = eval { MT::Decimal->new($subm->{membership_mrr}   // '0.00') } || MT::Decimal->new('0.00');
+    my $sub_mrr_d = eval { MT::Decimal->new($subm->{subscription_mrr} // '0.00') } || MT::Decimal->new('0.00');
+    my $tot_mrr_d = eval { $mem_mrr_d + $sub_mrr_d } || MT::Decimal->new('0.00');
+    my $mem_mrr   = $app->format_money($mem_mrr_d);
+    my $sub_mrr   = $app->format_money($sub_mrr_d);
+    my $tot_mrr   = $app->format_money($tot_mrr_d);
+
     my $pq_cnt   = $gm->{ssh_kex_pq_total}      // 0;
     my $cls_cnt  = $gm->{ssh_kex_classic_total} // 0;
     my $kex_tot  = $pq_cnt + $cls_cnt;
@@ -673,6 +691,8 @@ sub _draw_dashboard {
 
     $scr->write_str($x, $py++, sprintf("Active SSH Sessions : %d (total=%d)  | Orders: %d | GMV: \$%s (MT::Decimal)",
         scalar(@$sessions), $gm->{ssh_connections_total} // scalar(@$sessions), $gmv_cnt, $gmv_tot), $pal->{title}, $w);
+    $scr->write_str($x, $py++, sprintf("Memberships & Subs  : %d members | %d active subs | MRR: \$%s (Mem \$%s + Sub \$%s)",
+        $act_mem, $act_subs, $tot_mrr, $mem_mrr, $sub_mrr), $pal->{price}, $w);
     $scr->write_str($x, $py++, sprintf("Post-Quantum KEX    : PQ=%d Classic=%d (PQ Ratio: %s) | Auth Blocked: %d",
         $pq_cnt, $cls_cnt, $pq_ratio, $blocked), $pq_cnt > 0 ? $pal->{ok} : $pal->{normal}, $w);
     $scr->write_str($x, $py++, sprintf("Inventory CAS       : ok=%d conflict=%d | Stripe Webhooks: %d",
