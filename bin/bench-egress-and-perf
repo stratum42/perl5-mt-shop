@@ -1,0 +1,270 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../xs/Shop-SSH-Crypto/blib/lib";
+use lib "$FindBin::Bin/../xs/Shop-SSH-Crypto/blib/arch";
+
+use Time::HiRes qw(time);
+use MT;
+use MT::Channel;
+use MT::Cell;
+use MT::Decimal;
+
+use Shop::SSH::Crypto;
+use Shop::State::Inventory;
+use Shop::Domain::Pricing;
+use Shop::TUI::Screen;
+
+# ===========================================================================
+# perl5-mt-shop: Performance & Egress Benchmark
+# ===========================================================================
+
+sub fmt_num {
+    my ($n) = @_;
+    my $s = sprintf('%.0f', $n);
+    while ($s =~ s/^(-?\d+)(\d{3})/$1,$2/) {}
+    return $s;
+}
+
+# Worker entrypoint for 8-thread lock-free MT::Cell CAS benchmark
+sub cas_bench_worker {
+    my ($p_id, $c_id, $ops_per_worker, $out_id) = @_;
+    my $inv = Shop::State::Inventory->attach({ products_id => $p_id, cells_id => $c_id });
+    my $out = MT::Channel->attach($out_id);
+    my $ok_cnt = 0;
+    for (my $i = 0; $i < $ops_per_worker; $i++) {
+        my ($ok) = $inv->reserve('BENCH-SKU', 1);
+        if ($ok) {
+            $ok_cnt++;
+            $inv->release('BENCH-SKU', 1);
+        }
+    }
+    $out->send($ok_cnt);
+}
+
+# Prepare Inventory + freeze image BEFORE spawning MT::Worker threads
+my $inv = Shop::State::Inventory->new;
+$inv->upsert_product({
+    sku         => 'BENCH-SKU',
+    name        => 'Benchmark Hardware Unit',
+    category    => 'Bench',
+    description => 'CAS contention stress item',
+    price       => '199.9500',
+    stock       => 1000,
+    active      => 1,
+});
+my $inv_ids = $inv->state_ids;
+
+MT::Image::freeze();
+
+print "=============================================================================\n";
+print " perl5-mt-shop Performance & Egress Benchmark\n";
+print "=============================================================================\n\n";
+
+# ---------------------------------------------------------------------------
+# (a) MT::Decimal Checkout Pricing ops/sec
+# ---------------------------------------------------------------------------
+my $pricing_iters = int($ENV{BENCH_PRICING_ITERS} // 10_000);
+my $cart_items = [
+    { sku => 'VT-220', name => 'DEC VT220 Amber Terminal', qty => 2, unit_price => '429.00' },
+    { sku => 'KB-M01', name => 'Model M Clicky Keyboard',  qty => 1, unit_price => '149.95' },
+    { sku => 'AC-MUG', name => '0xDEADBEEF Enamel Mug',    qty => 3, unit_price => '19.95'  },
+];
+my $promo = { code => 'PERLMT20', kind => 'percent', value => '20.0000', min_subtotal => '0.0000' };
+
+my $t0 = time();
+my $last_res;
+for (my $i = 0; $i < $pricing_iters; $i++) {
+    $last_res = Shop::Domain::Pricing::calculate($cart_items, promo => $promo);
+}
+my $t_pricing = time() - $t0;
+$t_pricing = 1e-6 if $t_pricing <= 0;
+my $pricing_ops = $pricing_iters / $t_pricing;
+
+printf "[A] MT::Decimal (IEEE 754-2008 decimal128) Checkout Pricing\n";
+printf "    Iterations : %s\n", fmt_num($pricing_iters);
+printf "    Elapsed    : %.2f ms\n", $t_pricing * 1000;
+printf "    Throughput : %s pricing calcs/sec\n", fmt_num($pricing_ops);
+printf "    Exact Total: \$%s (subtotal=\$%s, discount=-\$%s, tax=\$%s, ship=\$%s)\n\n",
+    "$last_res->{total}", "$last_res->{subtotal}", "$last_res->{discount}",
+    "$last_res->{tax}", "$last_res->{shipping}";
+
+# ---------------------------------------------------------------------------
+# (b) 8-Worker Lock-Free MT::Cell CAS Inventory ops/sec
+# ---------------------------------------------------------------------------
+my $num_workers    = 8;
+my $pairs_per_w    = int($ENV{BENCH_CAS_PAIRS} // 5_000); # each pair = 1 reserve + 1 release = 2 CAS ops
+my $total_cas_ops  = $num_workers * $pairs_per_w * 2;
+my $res_ch         = MT::Channel->new(32);
+my $res_id         = $res_ch->id;
+
+my $t1 = time();
+my @workers;
+for (1 .. $num_workers) {
+    push @workers, MT::Worker::spawn(
+        'main::cas_bench_worker',
+        $inv_ids->{products_id},
+        $inv_ids->{cells_id},
+        $pairs_per_w,
+        $res_id,
+    );
+}
+MT::Worker::join($_) for @workers;
+my $t_cas = time() - $t1;
+$t_cas = 1e-6 if $t_cas <= 0;
+
+my $completed_pairs = 0;
+for (1 .. $num_workers) {
+    $completed_pairs += int($res_ch->recv);
+}
+my $final_stock = $inv->get_stock('BENCH-SKU');
+my $cas_ops_sec = ($completed_pairs * 2) / $t_cas;
+
+printf "[B] 8-Worker Lock-Free MT::Cell CAS Inventory\n";
+printf "    Workers    : %d OS threads (MT::Worker)\n", $num_workers;
+printf "    CAS Ops    : %s (%s reserve + %s release)\n",
+    fmt_num($completed_pairs * 2), fmt_num($completed_pairs), fmt_num($completed_pairs);
+printf "    Elapsed    : %.2f ms\n", $t_cas * 1000;
+printf "    Throughput : %s CAS ops/sec\n", fmt_num($cas_ops_sec);
+printf "    Stock Check: %d == 1000 (%s)\n\n",
+    $final_stock, ($final_stock == 1000 ? 'ZERO DRIFT' : 'MISMATCH!');
+
+# ---------------------------------------------------------------------------
+# (c) 100-Frame 80x24 TUI Egress Comparison
+# ---------------------------------------------------------------------------
+my $cols   = 80;
+my $rows   = 24;
+my $frames = 100;
+
+my @catalog = (
+    [ 'VT-220', 'DEC VT220 Amber Terminal',  'Terminals',   '$429.00', 12 ],
+    [ 'KB-M01', 'Model M Clicky Keyboard',   'Keyboards',   '$149.95', 14 ],
+    [ 'AC-MUG', '0xDEADBEEF Enamel Mug',     'Accessories', '$19.95',  42 ],
+    [ 'CF-ETH', 'Ethiopian Yirgacheffe 1lb', 'Coffee',      '$22.50',  88 ],
+    [ 'CF-COL', 'Colombian Supremo 1lb',     'Coffee',      '$19.50',  64 ],
+    [ 'SW-TEE', 'perl5-mt Fiber Tee (XL)',   'Apparel',     '$34.00',  25 ],
+    [ 'SW-HDY', 'Post-Quantum Hoodie',       'Apparel',     '$68.00',  19 ],
+    [ 'BK-CAM', 'Camel & Fibers Hardcover',  'Books',       '$54.00',  31 ],
+    [ 'HW-YUB', 'Ed25519 Hardware Key',      'Security',    '$55.00',  40 ],
+    [ 'AC-STK', 'ML-KEM-768 Sticker Pack',   'Accessories', '$8.50',  120 ],
+);
+
+my $scr  = Shop::TUI::Screen->new(cols => $cols, rows => $rows, color_depth => '256');
+my $zlib = Shop::SSH::Crypto::Zlib->new(5);
+
+my $st_hdr = Shop::TUI::Screen::pack_style(fg => 97, bg => 44, bold => 1);
+my $st_box = Shop::TUI::Screen::pack_style(fg => 36);
+my $st_sel = Shop::TUI::Screen::pack_style(fg => 30, bg => 46, bold => 1);
+my $st_row = Shop::TUI::Screen::pack_style(fg => 37);
+my $st_dim = Shop::TUI::Screen::pack_style(fg => 90, dim => 1);
+my $st_grn = Shop::TUI::Screen::pack_style(fg => 92, bold => 1);
+
+my $full_ansi_bytes  = 0;
+my $line_diff_bytes  = 0;
+my $cell_diff_bytes  = 0;
+my $wire_zlib_bytes  = 0;
+my @prev_lines       = ('') x $rows;
+
+for (my $f = 0; $f < $frames; $f++) {
+    my $sel_idx   = $f % scalar(@catalog);
+    my $cart_cnt  = int($f / 20);
+    my $live_tick = $f;
+
+    $scr->clear(0);
+    # Header
+    $scr->write_str(0, 0, sprintf('%-80s', " perl5-mt-shop | [PQ:MLKEM768] [ZLIB] [CAS] | Cart($cart_cnt) | Frame #$live_tick"), $st_hdr, $cols);
+    # Outer frame
+    $scr->box(0, 1, $cols, $rows - 3, $st_box, 'Catalog');
+    $scr->write_str(2, 2, sprintf('%-8s %-28s %-14s %9s %8s', 'SKU', 'PRODUCT', 'CATEGORY', 'PRICE', 'STOCK'), $st_dim, $cols - 4);
+
+    for my $i (0 .. $#catalog) {
+        my $p   = $catalog[$i];
+        my $stk = $p->[4] - ($i == 0 ? int($f / 25) : 0);
+        my $txt = sprintf('%-8s %-28s %-14s %9s %5d in', $p->[0], $p->[1], $p->[2], $p->[3], $stk);
+        my $st  = ($i == $sel_idx) ? $st_sel : $st_row;
+        $scr->write_str(2, 4 + $i, $txt, $st, $cols - 4);
+    }
+
+    # Detail preview + footer
+    my $cur = $catalog[$sel_idx];
+    $scr->write_str(2, 16, "Selected: $cur->[1] ($cur->[0]) - $cur->[3]", $st_grn, $cols - 4);
+    $scr->write_str(2, 18, "[j/k] Move  [a] Add  [R] 1-Key Reorder  [c] Cart  [o] Orders  [q] Quit", $st_dim, $cols - 4);
+    $scr->write_str(0, $rows - 1, sprintf('%-80s', " Status: Connected via ML-KEM-768+X25519 | Active Stock CAS: OK | Event #$f"), $st_dim, $cols);
+
+    # Build equivalent full-frame ANSI & line-diff ANSI from current 80x24 grid
+    my @curr_lines;
+    for my $y (0 .. $rows - 1) {
+        my $row_str = '';
+        my $base    = $y * $cols;
+        my $last_st = -1;
+        for my $x (0 .. $cols - 1) {
+            my $st = $scr->{curr_st}[$base + $x];
+            if ($st != $last_st) {
+                $row_str .= "\e[0;37m"; # representative SGR transition
+                $last_st = $st;
+            }
+            $row_str .= $scr->{curr_ch}[$base + $x];
+        }
+        push @curr_lines, $row_str;
+    }
+
+    # Mode 1: Full-frame uncompressed ANSI
+    my $full_frame = "\e[2J\e[H" . join("\r\n", @curr_lines);
+    $full_ansi_bytes += length($full_frame);
+
+    # Mode 2: Line-Diff Uncompressed (only changed rows, full row redrawn)
+    my $ldiff = '';
+    for my $y (0 .. $rows - 1) {
+        if ($curr_lines[$y] ne $prev_lines[$y]) {
+            $ldiff .= sprintf("\e[%d;1H%s", $y + 1, $curr_lines[$y]);
+            $prev_lines[$y] = $curr_lines[$y];
+        }
+    }
+    $line_diff_bytes += length($ldiff);
+
+    # Mode 3: perl5-mt-shop Cell-Diff + streaming zlib@openssh.com
+    my $diff_ansi = $scr->render();
+    $cell_diff_bytes += length($diff_ansi);
+    my $wire_chunk = length($diff_ansi) ? $zlib->deflate($diff_ansi) : '';
+    $wire_zlib_bytes += length($wire_chunk);
+}
+
+my $pct_line_save = (1 - ($line_diff_bytes / $full_ansi_bytes)) * 100;
+my $pct_cell_save = (1 - ($cell_diff_bytes / $full_ansi_bytes)) * 100;
+my $pct_wire_save = (1 - ($wire_zlib_bytes / $full_ansi_bytes)) * 100;
+
+# Projected egress cost for 1,000,000 sessions (100 frames/session)
+my $sessions     = 1_000_000;
+my $gb_full      = ($full_ansi_bytes * $sessions) / (1024**3);
+my $gb_line      = ($line_diff_bytes * $sessions) / (1024**3);
+my $gb_wire      = ($wire_zlib_bytes * $sessions) / (1024**3);
+
+my $aws_rate     = 0.09;   # $0.09 / GB AWS EC2/NAT egress
+my $bare_rate    = 0.005;  # $0.005 / GB bare-metal / colocation transit
+
+printf "[C] 100-Frame 80x24 TUI Egress Comparison (per session & 1M sessions)\n";
+printf "    %-38s %10s  %8s  %10s  %10s\n",
+    'Renderer / Transport Mode', 'Bytes/100f', 'Savings', 'AWS 1M ($)', 'Bare 1M ($)';
+printf "    %-38s %10s  %8s  %10s  %10s\n",
+    '-' x 38, '-' x 10, '-' x 8, '-' x 10, '-' x 10;
+printf "    %-38s %10s  %7.1f%%  \$%9.2f  \$%9.2f\n",
+    '1. Full-frame uncompressed',
+    fmt_num($full_ansi_bytes), 0.0, $gb_full * $aws_rate, $gb_full * $bare_rate;
+printf "    %-38s %10s  %7.1f%%  \$%9.2f  \$%9.2f\n",
+    '2. Line-diff uncompressed',
+    fmt_num($line_diff_bytes), $pct_line_save, $gb_line * $aws_rate, $gb_line * $bare_rate;
+printf "    %-38s %10s  %7.1f%%  \$%9.2f  \$%9.2f\n",
+    '3. Cell-diff raw',
+    fmt_num($cell_diff_bytes), $pct_cell_save,
+    (($cell_diff_bytes * $sessions) / (1024**3)) * $aws_rate,
+    (($cell_diff_bytes * $sessions) / (1024**3)) * $bare_rate;
+printf "    %-38s %10s  %7.1f%%  \$%9.2f  \$%9.2f\n\n",
+    '4. Cell-diff + zlib@openssh.com',
+    fmt_num($wire_zlib_bytes), $pct_wire_save, $gb_wire * $aws_rate, $gb_wire * $bare_rate;
+
+printf "    1M-Session Bandwidth: Full-frame = %.2f GB | Cell-diff + zlib = %.2f GB (%.1fx reduction)\n",
+    $gb_full, $gb_wire, ($wire_zlib_bytes > 0 ? $full_ansi_bytes / $wire_zlib_bytes : 0);
+print "=============================================================================\n";

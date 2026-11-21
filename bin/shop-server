@@ -1,0 +1,519 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../xs/Shop-SSH-Crypto/blib/lib";
+use lib "$FindBin::Bin/../xs/Shop-SSH-Crypto/blib/arch";
+
+BEGIN {
+    my $mojo_root = $ENV{MOJOLICIOUS_MT_ROOT} // "$FindBin::Bin/../../mojolicious-mt";
+    if (-d "$mojo_root/lib") {
+        for my $dir (
+            "$mojo_root/xs-keydb/blib/arch",
+            "$mojo_root/xs-keydb/blib/lib",
+            "$mojo_root/xs/blib/arch",
+            "$mojo_root/xs/blib/lib",
+            "$mojo_root/lib",
+        ) {
+            unshift @INC, $dir if -d $dir && !grep { $_ eq $dir } @INC;
+        }
+    }
+}
+
+use Getopt::Long qw(GetOptions);
+use JSON::PP qw(encode_json decode_json);
+use IO::Socket::INET;
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use POSIX qw(dup);
+use File::Path qw(make_path);
+use File::Basename qw(dirname);
+use Time::HiRes qw(time usleep);
+
+# Preload perl5-mt runtime & all Shop::* modules BEFORE MT::Image::freeze()
+use MT;
+use MT::Channel;
+use MT::Cell;
+use MT::SharedHash;
+use MT::Pool;
+use MT::Fiber;
+use MT::Supervisor;
+use MT::Fault;
+use MT::Checkpoint;
+use MT::Decimal;
+
+use Shop::SSH::Crypto;
+use Shop::SSH::Wire qw(load_or_generate_hostkey);
+use Shop::SSH::Transport;
+use Shop::SSH::Auth;
+use Shop::SSH::Session;
+
+use Shop::Metrics;
+BEGIN {
+    eval {
+        require Mojo::MT;
+        require Mojolicious;
+        require Mojo::Server::MT;
+        require Shop::Web::App;
+    };
+}
+use Shop::Webhook::Server;
+use Shop::DB;
+use Shop::Cache::KeyDB;
+use Shop::State::Inventory;
+use Shop::State::EventBus;
+use Shop::Domain::Pricing;
+use Shop::Domain::Cart;
+use Shop::Domain::Checkout;
+use Shop::Payment::Mock;
+use Shop::Payment::Stripe;
+
+use Shop::TUI::Screen;
+use Shop::TUI::Input;
+use Shop::TUI::App;
+use Shop::TUI::View::Catalog;
+use Shop::TUI::View::ProductDetail;
+use Shop::TUI::View::Cart;
+use Shop::TUI::View::Checkout;
+use Shop::TUI::View::Orders;
+use Shop::TUI::View::Account;
+use Shop::TUI::View::Admin;
+
+# ---------------------------------------------------------------------------
+# Worker entrypoints (named subs in frozen image)
+# ---------------------------------------------------------------------------
+package Shop::Server;
+
+use strict;
+use warnings;
+use Time::HiRes qw(time usleep);
+
+sub _decode_cfg {
+    my ($blob) = @_;
+    my ($cfg) = MT::Pool::_decode_list($blob);
+    return $cfg;
+}
+
+sub db_health_job {
+    my ($cfg_blob) = @_;
+    my $cfg = _decode_cfg($cfg_blob);
+    my $db  = Shop::DB->new($cfg->{db});
+    return $db->health() ? 1 : 0;
+}
+
+sub checkpoint_worker {
+    my ($cfg_blob, $products_id, $cells_id, $shutdown_id) = @_;
+    my $cfg      = _decode_cfg($cfg_blob);
+    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id });
+    my $shutdown = MT::Cell->attach($shutdown_id);
+    my $path     = $cfg->{checkpoint}{path} // 'var/inventory.mtck';
+    my $interval = $cfg->{workers}{checkpoint_interval_sec} // 30;
+    my $next_at  = time() + $interval;
+
+    while (!$shutdown->get()) {
+        MT::Supervisor::beat();
+        my $now = time();
+        if ($now >= $next_at) {
+            eval { $inv->save_checkpoint($path) };
+            warn "[checkpoint] save error: $@" if $@;
+            $next_at = $now + $interval;
+        }
+        usleep(100_000); # 100ms
+    }
+    return 1;
+}
+
+sub reaper_worker {
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $shutdown_id) = @_;
+    my $cfg      = _decode_cfg($cfg_blob);
+    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id });
+    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
+    my $shutdown = MT::Cell->attach($shutdown_id);
+
+    my $kdb = eval {
+        my $k = Shop::Cache::KeyDB->new(
+            host   => $cfg->{keydb}{host}   // '127.0.0.1',
+            port   => $cfg->{keydb}{port}   // 6379,
+            prefix => $cfg->{keydb}{prefix} // 's:',
+        );
+        $k->ping() ? $k : undef;
+    };
+
+    while (!$shutdown->get()) {
+        MT::Supervisor::beat();
+        if ($kdb) {
+            eval { $kdb->ping() };
+        }
+        usleep(200_000); # 200ms
+    }
+    return 1;
+}
+
+sub ops_worker {
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
+    my $cfg      = _decode_cfg($cfg_blob);
+    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
+    my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
+    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
+    my $shutdown = MT::Cell->attach($shutdown_id);
+    my $db       = Shop::DB->new($cfg->{db});
+
+    my $kdb = eval {
+        my $k = Shop::Cache::KeyDB->new(
+            host   => $cfg->{keydb}{host}   // '127.0.0.1',
+            port   => $cfg->{keydb}{port}   // 6379,
+            prefix => $cfg->{keydb}{prefix} // 's:',
+        );
+        $k->ping() ? $k : undef;
+    };
+
+    my $ops_host = $cfg->{ops}{host} // '127.0.0.1';
+    my $ops_port = defined($cfg->{ops}{port}) ? int($cfg->{ops}{port}) : 8088;
+    my $wh_sec   = $ENV{STRIPE_WEBHOOK_SECRET}
+        || $cfg->{ops}{webhook_secret}
+        || $cfg->{stripe}{webhook_secret}
+        || 'whsec_dev_perl5_mt_shop';
+
+    my $srv = Shop::Webhook::Server->new(
+        host           => $ops_host,
+        port           => $ops_port,
+        metrics        => $metrics,
+        db             => $db,
+        inventory      => $inv,
+        event_bus      => $eb,
+        keydb          => $kdb,
+        webhook_secret => $wh_sec,
+        shutdown_cell  => $shutdown,
+    );
+    eval { $srv->run() };
+    warn "[ops-worker] exited with error: $@" if $@;
+    return 1;
+}
+
+sub session_worker {
+    my ($worker_idx, $cfg_blob, $products_id, $cells_id, $sessions_id, $m_cells_id, $m_rl_id, $conn_chan_id, $shutdown_id) = @_;
+    my $cfg      = _decode_cfg($cfg_blob);
+    my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
+    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
+    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id });
+    my $conn_ch  = MT::Channel->attach($conn_chan_id);
+    my $shutdown = MT::Cell->attach($shutdown_id);
+
+    my $hostkey = Shop::SSH::Wire::load_or_generate_hostkey($cfg->{ssh}{host_key} // 'config/host_ed25519_key');
+    my $db      = Shop::DB->new($cfg->{db});
+    my $kdb     = eval {
+        my $k = Shop::Cache::KeyDB->new(
+            host   => $cfg->{keydb}{host}   // '127.0.0.1',
+            port   => $cfg->{keydb}{port}   // 6379,
+            prefix => $cfg->{keydb}{prefix} // 's:',
+        );
+        $k->ping() ? $k : undef;
+    };
+
+    my $stripe_key = $cfg->{stripe}{secret_key} // $ENV{STRIPE_SECRET_KEY} // '';
+    my $payment    = length($stripe_key)
+        ? Shop::Payment::Stripe->new(secret_key => $stripe_key)
+        : Shop::Payment::Mock->new();
+
+    my $active_fibers = 0;
+
+    # Dispatcher fiber accepts fds from $conn_ch and spawns per-connection MT::Fibers
+    MT::Fiber::schedule(sub {
+        while (!$shutdown->get()) {
+            MT::Supervisor::beat();
+            my ($ok, $fd) = $conn_ch->try_recv();
+            if ($ok && defined $fd && $fd >= 0) {
+                $active_fibers++;
+                my $client_fd = $fd;
+                MT::Fiber::schedule(sub {
+                    my $session_counted = 0;
+                    eval {
+                        open(my $sock, '+<&=', $client_fd)
+                            or die "fdopen($client_fd) failed: $!";
+                        binmode($sock);
+
+                        my $sess = Shop::SSH::Session->accept(
+                            sock              => $sock,
+                            hostkey           => $hostkey,
+                            allow_guest       => exists($cfg->{ssh}{allow_guest}) ? $cfg->{ssh}{allow_guest} : 1,
+                            compression_level => $cfg->{ssh}{compression_level} // 5,
+                            handshake_timeout => 15,
+                            auth_timeout      => 30,
+                            session_timeout   => 15,
+                        );
+
+                        $metrics->inc('ssh_active_sessions', 1);
+                        $session_counted = 1;
+
+                        # Record Post-Quantum vs Classical KEX metric
+                        my $sec = $sess->can('security_info') ? (eval { $sess->security_info() } || {}) : {};
+                        if ($sec->{is_pq} || (($sec->{kex} // '') =~ /mlkem/i)) {
+                            $metrics->inc('ssh_kex_pq_total', 1);
+                        } else {
+                            $metrics->inc('ssh_kex_classic_total', 1);
+                        }
+
+                        my $user = $sess->user();
+                        my $cart = Shop::Domain::Cart->new(
+                            user_fp   => $user->{fingerprint} // 'guest',
+                            inventory => $inv,
+                            keydb     => $kdb,
+                            db        => $db,
+                            lease_ttl => $cfg->{workers}{lease_ttl_sec} // 900,
+                        );
+                        my $checkout = Shop::Domain::Checkout->new(
+                            db        => $db,
+                            inventory => $inv,
+                            event_bus => $eb,
+                            keydb     => $kdb,
+                            payment   => $payment,
+                            hostkey   => $hostkey,
+                            metrics   => $metrics,
+                        );
+
+                        my $app = Shop::TUI::App->new(
+                            session    => $sess,
+                            session_id => "w${worker_idx}-fd${client_fd}-" . int(time() * 1000),
+                            config     => $cfg,
+                            db         => $db,
+                            keydb      => $kdb,
+                            inventory  => $inv,
+                            event_bus  => $eb,
+                            metrics    => $metrics,
+                            hostkey    => $hostkey,
+                            cart       => $cart,
+                            checkout   => $checkout,
+                            user       => $user,
+                        );
+                        $app->run();
+                    };
+                    if ($@) {
+                        warn "[worker-$worker_idx] session ended with error: $@"
+                            unless $@ =~ /EOF|closed|disconnect/i;
+                    }
+                    $metrics->dec('ssh_active_sessions', 1) if $session_counted;
+                    $active_fibers--;
+                });
+                MT::Fiber::pass();
+            } else {
+                MT::Fiber::pass();
+                usleep($active_fibers > 0 ? 1_000 : 10_000);
+            }
+        }
+    });
+
+    MT::Fiber::run();
+    return 1;
+}
+
+# ---------------------------------------------------------------------------
+# Main server entrypoint
+# ---------------------------------------------------------------------------
+package main;
+
+my $config_path = "$FindBin::Bin/../config/shop.json";
+my ($opt_host, $opt_port, $opt_driver, $opt_ops_host, $opt_ops_port, $opt_no_ops);
+
+GetOptions(
+    'config=s'    => \$config_path,
+    'host=s'      => \$opt_host,
+    'port=i'      => \$opt_port,
+    'db-driver=s' => \$opt_driver,
+    'ops-host=s'  => \$opt_ops_host,
+    'ops-port=i'  => \$opt_ops_port,
+    'no-ops!'     => \$opt_no_ops,
+) or die "Usage: $0 [--config path] [--host addr] [--port N] [--db-driver sqlite|db2|informix] [--ops-port N] [--no-ops]\n";
+
+open(my $cfh, '<', $config_path) or die "Cannot open config $config_path: $!\n";
+my $raw_cfg = do { local $/; <$cfh> };
+close($cfh);
+sub _normalize_cfg {
+    my ($v) = @_;
+    return $v unless ref($v);
+    if (ref($v) eq 'HASH')  { return { map { $_ => _normalize_cfg($v->{$_}) } keys %$v }; }
+    if (ref($v) eq 'ARRAY') { return [ map { _normalize_cfg($_) } @$v ]; }
+    return $v ? 1 : 0; # JSON::PP::Boolean -> plain 0/1
+}
+my $cfg = _normalize_cfg(decode_json($raw_cfg));
+
+$cfg->{ssh}{host}   = $opt_host     if defined $opt_host;
+$cfg->{ssh}{port}   = $opt_port     if defined $opt_port;
+$cfg->{ops}{host}   = $opt_ops_host if defined $opt_ops_host;
+$cfg->{ops}{port}   = $opt_ops_port if defined $opt_ops_port;
+$cfg->{ops}{port}   = 0             if $opt_no_ops;
+$cfg->{db}{driver}  = $opt_driver   if defined $opt_driver;
+$cfg->{db}{driver}  = $ENV{SHOP_DB_DRIVER} if defined $ENV{SHOP_DB_DRIVER} && length($ENV{SHOP_DB_DRIVER});
+if (defined $ENV{SHOP_ADMIN_FP} && length($ENV{SHOP_ADMIN_FP})) {
+    push @{ $cfg->{admin_fingerprints} }, split(/,/, $ENV{SHOP_ADMIN_FP});
+}
+
+# Ensure var/ directory exists
+my $ckpt_path = $cfg->{checkpoint}{path} // 'var/inventory.mtck';
+make_path(dirname($ckpt_path));
+if ($cfg->{db}{sqlite_path}) {
+    make_path(dirname($cfg->{db}{sqlite_path}));
+}
+
+# 1. Host key
+my $hostkey_path = $cfg->{ssh}{host_key} // 'config/host_ed25519_key';
+my $hostkey = load_or_generate_hostkey($hostkey_path);
+
+# 2. Database init & seed
+my $db = Shop::DB->new($cfg->{db});
+my $prods = eval { $db->list_products() };
+if (!$prods || !@$prods) {
+    my $drv = $db->driver();
+    if ($drv eq 'informix') {
+        die "Informix database is not initialized. Run: ./docker/init-informix.sh\n";
+    }
+    my $schema = ($drv eq 'db2')
+        ? ($cfg->{db}{schema_db2}    // 'sql/schema_db2.sql')
+        : ($cfg->{db}{schema_sqlite} // 'sql/schema_sqlite.sql');
+    my $seed = $cfg->{db}{seed_sql} // 'sql/seed.sql';
+    $db->init_schema($schema, $seed);
+}
+
+# 3. Lock-free Metrics, Hot Inventory (MT::SharedHash + per-SKU MT::Cell) & EventBus
+my $metrics   = Shop::Metrics->new();
+my $inventory = Shop::State::Inventory->new(metrics => $metrics);
+my $loaded    = $inventory->load_from_db($db);
+if (-f $ckpt_path) {
+    eval { $inventory->load_checkpoint($ckpt_path) };
+    warn "[shop-server] checkpoint restore note: $@" if $@;
+}
+my $event_bus = Shop::State::EventBus->new();
+
+my $inv_ids = $inventory->state_ids();
+my $eb_ids  = $event_bus->state_ids();
+my $m_ids   = $metrics->state_ids();
+
+# Shared shutdown flag and incoming client fd channel
+my $shutdown_cell = MT::Cell->new(0);
+my $conn_chan     = MT::Channel->new(256);
+
+# Register MT::Fault observer
+MT::Fault::on(sub {
+    my ($f) = @_;
+    $metrics->inc('supervisor_faults_total', 1);
+    warn sprintf("[MT::Fault #%d] [%s] %s:%s %s\n",
+        $f->{seq} // 0, $f->{cause} // '?', $f->{unit_kind} // '?', $f->{unit_id} // '?', $f->{message} // '');
+});
+
+# 4. Freeze shared Perl image BEFORE spawning any MT::Pool / MT::Worker threads!
+Shop::Webhook::Server::prepare_for_freeze();
+Mojo::MT::prepare_for_freeze() if defined &Mojo::MT::prepare_for_freeze;
+MT::Image::freeze();
+
+my $cfg_json = MT::Pool::_encode_list($cfg);
+
+# 5. Spawn supervised DB MT::Pool
+my $db_pool = MT::Pool->new(
+    workers => $cfg->{workers}{db_pool_workers} // 2,
+);
+
+# 6. Spawn background workers (Checkpoint + KeyDB/Lease Reaper + Optional Ops/Webhook HTTP Server)
+my @workers;
+push @workers, MT::Worker::spawn(
+    'Shop::Server::checkpoint_worker',
+    $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id}, $shutdown_cell->id
+);
+push @workers, MT::Worker::spawn(
+    'Shop::Server::reaper_worker',
+    $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id}, $eb_ids->{sessions_id}, $shutdown_cell->id
+);
+
+my $ops_port = defined($cfg->{ops}{port}) ? int($cfg->{ops}{port}) : 8088;
+my $ops_host = $cfg->{ops}{host} // '127.0.0.1';
+if ($ops_port > 0) {
+    push @workers, MT::Worker::spawn(
+        'Shop::Server::ops_worker',
+        $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id},
+        $eb_ids->{sessions_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
+    );
+}
+
+# 7. Spawn N Session Workers running MT::Fiber cooperative loops
+my $n_sess = $cfg->{workers}{session_workers} // 4;
+for my $idx (1 .. $n_sess) {
+    push @workers, MT::Worker::spawn(
+        'Shop::Server::session_worker',
+        $idx, $cfg_json,
+        $inv_ids->{products_id}, $inv_ids->{cells_id},
+        $eb_ids->{sessions_id},
+        $m_ids->{cells_id}, $m_ids->{ratelimit_id},
+        $conn_chan->id,
+        $shutdown_cell->id
+    );
+}
+
+# 8. Start non-blocking SSH TCP listener
+my $listen_host = $cfg->{ssh}{host} // '0.0.0.0';
+my $listen_port = $cfg->{ssh}{port} // 2222;
+my $rate_limit  = $cfg->{ssh}{rate_limit_per_min} // 60;
+my $server = IO::Socket::INET->new(
+    LocalAddr => $listen_host,
+    LocalPort => $listen_port,
+    Proto     => 'tcp',
+    Listen    => 128,
+    ReuseAddr => 1,
+) or die "Cannot listen on $listen_host:$listen_port: $!\n";
+
+my $fl = fcntl($server, F_GETFL, 0);
+fcntl($server, F_SETFL, $fl | O_NONBLOCK) if defined $fl;
+
+my $stop = 0;
+$SIG{INT}  = sub { $stop = 1; };
+$SIG{TERM} = sub { $stop = 1; };
+$SIG{PIPE} = 'IGNORE';
+
+$| = 1;
+my $ops_msg = $ops_port > 0
+    ? "http://$ops_host:$ops_port (/healthz, /metrics, /api/catalog, /webhooks/stripe, /webhooks/shippo)"
+    : "disabled";
+print "[shop-server] Listening on ssh://$listen_host:$listen_port "
+    . "(db=" . $db->driver() . ", products=$loaded, session_workers=$n_sess, kex=mlkem768x25519-sha256, compression=zlib\@openssh.com, ops=$ops_msg)\n";
+
+my $last_sup_tick = time();
+while (!$stop) {
+    my $client = $server->accept();
+    if ($client) {
+        my $peer_ip = eval { $client->peerhost() } || 'unknown';
+        if ($rate_limit > 0 && !$metrics->check_rate_limit($peer_ip, $rate_limit)) {
+            close($client);
+        } else {
+            $metrics->inc('ssh_connections_total', 1);
+            my $raw_fd = fileno($client);
+            my $dup_fd = defined($raw_fd) ? POSIX::dup($raw_fd) : undef;
+            close($client);
+            if (defined $dup_fd && $dup_fd >= 0) {
+                $conn_chan->send($dup_fd);
+            }
+        }
+    } else {
+        usleep(5_000); # 5ms accept poll
+    }
+
+    my $now = time();
+    if ($now - $last_sup_tick >= 0.25) {
+        MT::Supervisor::tick();
+        $last_sup_tick = $now;
+    }
+}
+
+print "\n[shop-server] Shutting down cleanly...\n";
+$shutdown_cell->set(1);
+close($server);
+$conn_chan->close();
+
+for my $w (@workers) {
+    eval { MT::Worker::join($w) };
+}
+
+print "[shop-server] Saving final MT::Checkpoint to $ckpt_path...\n";
+eval { $inventory->save_checkpoint($ckpt_path) };
+warn "[shop-server] Final checkpoint error: $@" if $@;
+
+eval { $db_pool->shutdown() };
+print "[shop-server] Shutdown complete.\n";
+exit 0;

@@ -1,0 +1,38 @@
+# Build artifacts
+blib/
+lib/auto/
+xs/Shop-SSH-Crypto/Makefile
+xs/Shop-SSH-Crypto/Makefile.old
+xs/Shop-SSH-Crypto/MYMETA.json
+xs/Shop-SSH-Crypto/MYMETA.yml
+xs/Shop-SSH-Crypto/Crypto.c
+xs/Shop-SSH-Crypto/Crypto.o
+xs/Shop-SSH-Crypto/Crypto.bs
+xs/Shop-SSH-Crypto/blib/
+xs/Shop-SSH-Crypto/pm_to_blib
+*.o
+*.so
+*.bundle
+*.bs
+
+# Runtime state, secrets, and host keys
+var/
+config/host_ed25519_key
+config/host_ed25519_key.pub
+docker/.env
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.mtck
+*.log
+*.tmp
+
+# OS / Editor
+.DS_Store
+*.swp
+*~
+
+# Python bytecode
+__pycache__/
+*.pyc

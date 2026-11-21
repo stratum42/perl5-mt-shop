@@ -1,0 +1,45 @@
+{
+  "ssh": {
+    "host": "0.0.0.0",
+    "port": 2222,
+    "host_key": "config/host_ed25519_key",
+    "allow_guest": true,
+    "compression_level": 5,
+    "rate_limit_per_min": 60
+  },
+  "ops": {
+    "host": "127.0.0.1",
+    "port": 8088,
+    "webhook_secret": "whsec_dev_perl5_mt_shop"
+  },
+  "workers": {
+    "session_workers": 4,
+    "db_pool_workers": 2,
+    "checkpoint_interval_sec": 30,
+    "lease_ttl_sec": 900
+  },
+  "db": {
+    "driver": "sqlite",
+    "sqlite_path": "var/shop.db",
+    "gateway_url": "http://127.0.0.1:50050",
+    "informix_gateway_url": "http://127.0.0.1:50051",
+    "schema_db2": "sql/schema_db2.sql",
+    "schema_informix": "sql/schema_informix.sql",
+    "schema_sqlite": "sql/schema_sqlite.sql",
+    "seed_sql": "sql/seed.sql"
+  },
+  "keydb": {
+    "host": "127.0.0.1",
+    "port": 6379,
+    "prefix": "s:"
+  },
+  "checkpoint": {
+    "path": "var/inventory.mtck"
+  },
+  "stripe": {
+    "secret_key": "",
+    "webhook_secret": "whsec_dev_perl5_mt_shop"
+  },
+  "tax_rate": "0.0825",
+  "admin_fingerprints": []
+}

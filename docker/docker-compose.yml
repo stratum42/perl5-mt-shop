@@ -1,0 +1,130 @@
+services:
+  db2:
+    image: icr.io/db2_community/db2:latest
+    container_name: perl5mt-shop-db2
+    platform: linux/amd64
+    privileged: true
+    restart: unless-stopped
+    environment:
+      LICENSE: accept
+      DB2INSTANCE: db2inst1
+      DB2INST1_PASSWORD: ShopDb2Pass1!
+      DBNAME: SHOPDB
+      BLU: "false"
+      ENABLE_ORACLE_COMPATIBILITY: "false"
+      UPDATEAVAIL: "NO"
+      TO_CREATE_SAMPLEDB: "false"
+      REPODB: "false"
+      IS_OSXFS: "false"
+      PERSISTENT_HOME: "false"
+      HADR_ENABLED: "false"
+      ARCHIVE_LOGS: "false"
+    ports:
+      - "${DB2_PORT:-50000}:50000"
+    volumes:
+      - db2_data:/database
+    healthcheck:
+      test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to SHOPDB && db2 terminate' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  db2-gateway:
+    build:
+      context: ./db2-gateway
+      dockerfile: Dockerfile
+    container_name: perl5mt-shop-db2-gateway
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      db2:
+        condition: service_healthy
+    environment:
+      DB2_HOST: db2
+      DB2_PORT: "50000"
+      DB2_DATABASE: SHOPDB
+      DB2_USER: db2inst1
+      DB2_PASSWORD: ShopDb2Pass1!
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "50050"
+      POOL_SIZE: "8"
+    ports:
+      - "127.0.0.1:${DB2_GATEWAY_PORT:-50050}:50050"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:50050/health', timeout=3)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  keydb:
+    image: eqalpha/keydb:latest
+    container_name: perl5mt-shop-keydb
+    restart: unless-stopped
+    command: ["keydb-server", "--server-threads", "4", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${KEYDB_PORT:-6379}:6379"
+    volumes:
+      - keydb_data:/data
+    healthcheck:
+      test: ["CMD", "keydb-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  informix:
+    image: icr.io/informix/informix-developer-database:latest
+    container_name: perl5mt-shop-informix
+    platform: linux/amd64
+    privileged: true
+    restart: unless-stopped
+    environment:
+      LICENSE: accept
+      SIZE: small
+    ports:
+      - "127.0.0.1:${INFORMIX_PORT:-9088}:9088"
+      - "127.0.0.1:${INFORMIX_DRDA_PORT:-9089}:9089"
+    volumes:
+      - informix_data:/opt/ibm/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'onstat -' 2>/dev/null | grep -q 'On-Line'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  informix-gateway:
+    build:
+      context: ./informix-gateway
+      dockerfile: Dockerfile
+    container_name: perl5mt-shop-informix-gateway
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      informix:
+        condition: service_healthy
+    environment:
+      INFORMIX_HOST: informix
+      INFORMIX_PORT: "9089"
+      INFORMIX_DATABASE: shopdb
+      INFORMIX_USER: informix
+      INFORMIX_PASSWORD: in4mix
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "50051"
+      POOL_SIZE: "8"
+      INFORMIX_SP_ONLY: "${INFORMIX_SP_ONLY:-1}"
+      INFORMIX_ADMIN_KEY: "${INFORMIX_ADMIN_KEY:-shop-informix-admin-bootstrap}"
+    ports:
+      - "127.0.0.1:${INFORMIX_GATEWAY_PORT:-50051}:50051"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:50051/health', timeout=3)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  db2_data:
+  keydb_data:
+  informix_data:
