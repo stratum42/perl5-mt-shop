@@ -118,6 +118,40 @@ every keypress:
   Prometheus text on `GET /metrics`. Pre-auth IP rate limiting uses a second
   `MT::SharedHash`.
 
+## Cooperative Clustering and Pre-Fiber DoS Blackhole
+
+Multi-node operation is disabled by default (`cluster.enabled: false`) so
+single-node deployments behave identically. When enabled with `--cluster`, three
+modules coordinate routing and abuse mitigation:
+
+- **Deterministic Wavefunction (`Shop::Cluster::Wavefunction`)**: Maintains a
+  normalized complex state vector over the sorted list of active node IDs
+  ($\|\psi\|_2 = 1$). Each logical step evolves via a split-step ring Laplacian
+  propagator plus a load-repulsive phase kick without consulting wall-clock
+  time, producing bit-identical `state_digest()` values across all nodes at the
+  same step. Hilbert-space expansion and contraction (`resize()`) re-seed new
+  nodes isometrically and renormalize. Connection routing maps `(peer_ip, seq)`
+  through SHA-256 onto the load-weighted Born distribution so overloaded nodes
+  shed traffic to lightly loaded peers.
+- **Mesh Bus and L4 Splice (`Shop::Cluster::Mesh`)**: Periodically publishes
+  local node state to KeyDB (`cluster:node:<id>` with 10 s TTL), scans active
+  peers, advances the shared logical step via `INCR cluster:wave_step`, verifies
+  same-step peer digest coherence, and stores the latest status JSON in an
+  `MT::Cell` for lock-free reads by `GET /api/cluster` and the Admin dashboard.
+  When `choose_node()` selects a remote peer, a session worker fiber splices the
+  TCP stream at L4 (`relay_socket()` with `IO::Poll` and a single 8 KiB buffer)
+  without decrypting SSH packets or allocating zlib/TUI state on the forwarding
+  node.
+- **DoS Blackhole (`Shop::Cluster::Blackhole`)**: Backed by `MT::SharedHash`
+  (`bans` and `strikes`) and `MT::Cell` counters (`blackholed_count`,
+  `banned_count`). The main accept loop checks `is_banned($peer_ip)` before
+  rate limiting or fiber dispatch; banned peers are closed immediately via
+  `shunt_socket()` (`SO_LINGER {1, 0}`, 0 fibers spawned, 0 bytes transmitted).
+  Rate-limit trips and session protocol violations (Terrapin strict-KEX
+  violation, `SSH_ZIP_BOMB`, invalid client banner, auth floods) increment
+  strike scores via `record_violation()`, auto-banning repeat or severe
+  offenders and syncing `dos:ban:<ip>` keys across cluster peers through KeyDB.
+
 ## How Memory and Egress Were Measured
 
 - **Egress and Throughput (`bin/bench-egress-and-perf`)**:

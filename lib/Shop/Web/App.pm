@@ -18,6 +18,9 @@ has 'shippo_webhook_secret' => sub { $ENV{SHIPPO_WEBHOOK_SECRET} // '' };
 has 'tolerance_sec'         => 300;
 has 'idempotency';
 has 'http_engine'           => 'mojolicious-mt';
+has 'cluster_cell';
+has 'cluster_enabled'       => 0;
+has 'blackhole';
 
 sub startup {
     my ($self) = @_;
@@ -111,6 +114,36 @@ sub startup {
             ok    => Mojo::JSON::true,
             count => scalar(@tiers),
             tiers => \@tiers,
+        });
+    });
+
+    $r->get('/api/cluster' => sub {
+        my ($c) = @_;
+        my $snapshot = {};
+        if (my $cell = $self->cluster_cell) {
+            my $raw = eval { $cell->get };
+            if (defined $raw && length $raw) {
+                my $dec = eval { decode_json($raw) };
+                $snapshot = $dec if ref($dec) eq 'HASH';
+            }
+        }
+        my $bh_stats = {};
+        if (my $bh = $self->blackhole) {
+            my $st = eval { $bh->stats };
+            $bh_stats = $st if ref($st) eq 'HASH';
+        }
+        elsif ($self->metrics) {
+            $bh_stats = {
+                blackholed_total => $self->metrics->get('ssh_dos_blackholed_total'),
+                banned_ips       => $self->metrics->get('ssh_dos_banned_ips'),
+                mode             => 'drop',
+            };
+        }
+        $c->render(json => {
+            ok        => Mojo::JSON::true,
+            enabled   => $self->cluster_enabled ? 1 : 0,
+            cluster   => $snapshot,
+            blackhole => $bh_stats,
         });
     });
 

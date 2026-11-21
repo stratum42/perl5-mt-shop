@@ -37,7 +37,13 @@ terminal UI.
 - Embedded HTTP ops and webhook worker (`Shop::Web::App` on `mojolicious-mt`
   with `Mojo::Server::Daemon`, `Mojo::Reactor::MT`, and `Mojo::MT::Accel`)
   serving `GET /healthz`, Prometheus `GET /metrics`, `GET /api/catalog`,
-  `GET /api/memberships`, `POST /webhooks/stripe`, and `POST /webhooks/shippo`.
+  `GET /api/memberships`, `GET /api/cluster`, `POST /webhooks/stripe`, and
+  `POST /webhooks/shippo`.
+- Optional cooperative multi-node SSH clustering (`Shop::Cluster::Wavefunction`,
+  `Shop::Cluster::Mesh`) over KeyDB with deterministic load-repulsive routing
+  and raw L4 TCP splice forwarding (disabled by default), plus a pre-fiber O(1)
+  DoS blackhole (`Shop::Cluster::Blackhole`) that shunts banned peers with
+  `SO_LINGER {1, 0}` and zero egress bytes.
 
 ## Requirements
 

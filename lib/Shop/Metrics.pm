@@ -23,6 +23,12 @@ my @STANDARD_METRICS = (
     [ 'orders_total',                 'counter', 'Total orders committed' ],
     [ 'webhooks_processed_total',     'counter', 'Total Stripe webhooks verified and processed' ],
     [ 'supervisor_faults_total',      'counter', 'Total MT::Supervisor worker faults detected' ],
+    [ 'cluster_nodes_active',         'gauge',   'Active nodes in the cooperative SSH cluster' ],
+    [ 'cluster_wave_step',            'gauge',   'Current deterministic wavefunction evolution step' ],
+    [ 'cluster_coherence_ok',         'gauge',   'Whether local wavefunction digest matches peer digests (1=ok, 0=drift)' ],
+    [ 'cluster_relayed_total',        'counter', 'Incoming SSH connections relayed at L4 to peer cluster nodes' ],
+    [ 'ssh_dos_blackholed_total',     'counter', 'Incoming SSH connections shunted pre-fiber by DoS blackhole' ],
+    [ 'ssh_dos_banned_ips',           'gauge',   'Currently banned IP addresses in the DoS blackhole table' ],
 );
 
 my %METRIC_META = map { $_->[0] => { type => $_->[1], help => $_->[2] } } @STANDARD_METRICS;

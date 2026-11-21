@@ -31,6 +31,7 @@ use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use POSIX qw(dup);
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
+use Sys::Hostname qw(hostname);
 use Time::HiRes qw(time usleep);
 
 # Preload perl5-mt runtime & all Shop::* modules BEFORE MT::Image::freeze()
@@ -52,6 +53,9 @@ use Shop::SSH::Auth;
 use Shop::SSH::Session;
 
 use Shop::Metrics;
+use Shop::Cluster::Wavefunction;
+use Shop::Cluster::Blackhole;
+use Shop::Cluster::Mesh;
 BEGIN {
     eval {
         require Mojo::MT;
@@ -131,12 +135,13 @@ sub checkpoint_worker {
 }
 
 sub reaper_worker {
-    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
-    my $cfg      = _decode_cfg($cfg_blob);
-    my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
-    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
-    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
-    my $shutdown = MT::Cell->attach($shutdown_id);
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $bh_ids_blob, $shutdown_id) = @_;
+    my $cfg       = _decode_cfg($cfg_blob);
+    my $metrics   = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
+    my $blackhole = defined($bh_ids_blob) ? Shop::Cluster::Blackhole->attach(_decode_cfg($bh_ids_blob)) : undef;
+    my $inv       = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
+    my $eb        = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
+    my $shutdown  = MT::Cell->attach($shutdown_id);
     my $db       = Shop::DB->new($cfg->{db});
     my $hostkey  = Shop::SSH::Wire::load_or_generate_hostkey($cfg->{ssh}{host_key} // 'config/host_ed25519_key');
 
@@ -198,6 +203,13 @@ sub reaper_worker {
         if ($now >= $next_prune_at) {
             eval { $metrics->prune_rate_limits(120) };
             warn "[reaper] rate-limit prune error: $@" if $@;
+            if ($blackhole) {
+                eval {
+                    $blackhole->prune_expired();
+                    $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+                };
+                warn "[reaper] blackhole prune error: $@" if $@;
+            }
             $next_prune_at = $now + $prune_interval;
         }
         usleep(200_000); # 200ms
@@ -206,13 +218,15 @@ sub reaper_worker {
 }
 
 sub ops_worker {
-    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $shutdown_id) = @_;
-    my $cfg      = _decode_cfg($cfg_blob);
-    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
-    my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
-    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
-    my $shutdown = MT::Cell->attach($shutdown_id);
-    my $db       = Shop::DB->new($cfg->{db});
+    my ($cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $bh_ids_blob, $cluster_snap_id, $shutdown_id) = @_;
+    my $cfg          = _decode_cfg($cfg_blob);
+    my $eb           = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
+    my $metrics      = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
+    my $blackhole    = defined($bh_ids_blob) ? Shop::Cluster::Blackhole->attach(_decode_cfg($bh_ids_blob)) : undef;
+    my $cluster_snap = defined($cluster_snap_id) ? MT::Cell->attach($cluster_snap_id) : undef;
+    my $inv          = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
+    my $shutdown     = MT::Cell->attach($shutdown_id);
+    my $db           = Shop::DB->new($cfg->{db});
 
     my $kdb = eval {
         my $k = Shop::Cache::KeyDB->new(
@@ -231,15 +245,18 @@ sub ops_worker {
         || 'whsec_dev_perl5_mt_shop';
 
     my $srv = Shop::Webhook::Server->new(
-        host           => $ops_host,
-        port           => $ops_port,
-        metrics        => $metrics,
-        db             => $db,
-        inventory      => $inv,
-        event_bus      => $eb,
-        keydb          => $kdb,
-        webhook_secret => $wh_sec,
-        shutdown_cell  => $shutdown,
+        host            => $ops_host,
+        port            => $ops_port,
+        metrics         => $metrics,
+        db              => $db,
+        inventory       => $inv,
+        event_bus       => $eb,
+        keydb           => $kdb,
+        webhook_secret  => $wh_sec,
+        cluster_cell    => $cluster_snap,
+        cluster_enabled => ($cfg->{cluster} && $cfg->{cluster}{enabled}) ? 1 : 0,
+        blackhole       => $blackhole,
+        shutdown_cell   => $shutdown,
     );
     eval { $srv->run() };
     warn "[ops-worker] exited with error: $@" if $@;
@@ -247,13 +264,16 @@ sub ops_worker {
 }
 
 sub session_worker {
-    my ($worker_idx, $cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $conn_chan_id, $shutdown_id) = @_;
-    my $cfg      = _decode_cfg($cfg_blob);
-    my $metrics  = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
-    my $inv      = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
-    my $eb       = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
-    my $conn_ch  = MT::Channel->attach($conn_chan_id);
-    my $shutdown = MT::Cell->attach($shutdown_id);
+    my ($worker_idx, $cfg_blob, $products_id, $cells_id, $sessions_id, $eb_free_id, $m_cells_id, $m_rl_id, $bh_ids_blob, $cluster_snap_id, $conn_chan_id, $shutdown_id) = @_;
+    my $cfg       = _decode_cfg($cfg_blob);
+    my $metrics   = Shop::Metrics->attach({ cells_id => $m_cells_id, ratelimit_id => $m_rl_id });
+    my $blackhole = defined($bh_ids_blob) ? Shop::Cluster::Blackhole->attach(_decode_cfg($bh_ids_blob)) : undef;
+    my $inv       = Shop::State::Inventory->attach({ products_id => $products_id, cells_id => $cells_id }, metrics => $metrics);
+    my $eb        = Shop::State::EventBus->attach({ sessions_id => $sessions_id, free_id => $eb_free_id });
+    my $conn_ch   = MT::Channel->attach($conn_chan_id);
+    my $shutdown  = MT::Cell->attach($shutdown_id);
+    $cfg->{cluster} ||= {};
+    $cfg->{cluster}{_snap_cell_id} = $cluster_snap_id if defined $cluster_snap_id;
 
     my $hostkey = Shop::SSH::Wire::load_or_generate_hostkey($cfg->{ssh}{host_key} // 'config/host_ed25519_key');
     my $db      = Shop::DB->new($cfg->{db});
@@ -305,11 +325,41 @@ sub session_worker {
 
             my $accepted = 0;
             while ($accepted < 64 && !$shutdown->get()) {
-                my ($ok, $fd) = $conn_ch->try_recv();
-                last unless $ok && defined $fd && $fd >= 0;
+                my ($ok, $msg) = $conn_ch->try_recv();
+                last unless $ok && defined $msg;
+
+                if ($msg =~ /^RELAY:(\d+):([^:]+):(\d+)$/) {
+                    my ($r_fd, $r_host, $r_port) = (int($1), $2, int($3));
+                    $accepted++;
+                    $active_fibers++;
+                    MT::Fiber::schedule(sub {
+                        eval {
+                            open(my $rsock, '+<&=', $r_fd)
+                                or die "fdopen($r_fd) failed: $!";
+                            binmode($rsock);
+                            $metrics->inc('cluster_relayed_total', 1);
+                            Shop::Cluster::Mesh::relay_socket($rsock, $r_host, $r_port, $shutdown);
+                        };
+                        if ($@) {
+                            warn "[worker-$worker_idx] relay ended with error: $@"
+                                unless $@ =~ /EOF|closed|disconnect/i;
+                        }
+                        $active_fibers--;
+                    });
+                    next;
+                }
+
+                my ($client_fd, $peer_ip);
+                if ($msg =~ /^LOCAL:(\d+):(.*)$/) {
+                    ($client_fd, $peer_ip) = (int($1), $2);
+                } elsif ($msg =~ /^\d+$/) {
+                    ($client_fd, $peer_ip) = (int($msg), 'unknown');
+                } else {
+                    next;
+                }
+
                 $accepted++;
                 $active_fibers++;
-                my $client_fd = $fd;
                 MT::Fiber::schedule(sub {
                     my $session_counted = 0;
                     eval {
@@ -392,8 +442,24 @@ sub session_worker {
                         $app->run();
                     };
                     if ($@) {
-                        warn "[worker-$worker_idx] session ended with error: $@"
-                            unless $@ =~ /EOF|closed|disconnect/i;
+                        my $err = "$@";
+                        if ($blackhole && defined $peer_ip && length($peer_ip) && $peer_ip ne 'unknown') {
+                            if ($err =~ /Strict KEX violation|SSH_STRICT_KEX/i) {
+                                $blackhole->record_violation($peer_ip, 'terrapin_strict_kex', 3, $kdb);
+                                $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+                            } elsif ($err =~ /SSH_ZIP_BOMB|zip.?bomb/i) {
+                                $blackhole->record_violation($peer_ip, 'zip_bomb', 3, $kdb);
+                                $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+                            } elsif ($err =~ /invalid client banner/i) {
+                                $blackhole->record_violation($peer_ip, 'bad_banner', 1, $kdb);
+                                $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+                            } elsif ($err =~ /too many authentication attempts/i) {
+                                $blackhole->record_violation($peer_ip, 'auth_flood', 2, $kdb);
+                                $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+                            }
+                        }
+                        warn "[worker-$worker_idx] session ended with error: $err"
+                            unless $err =~ /EOF|closed|disconnect/i;
                     }
                     $metrics->dec('ssh_active_sessions', 1) if $session_counted;
                     $active_fibers--;
@@ -462,16 +528,20 @@ package main;
 
 my $config_path = "$FindBin::Bin/../config/shop.json";
 my ($opt_host, $opt_port, $opt_driver, $opt_ops_host, $opt_ops_port, $opt_no_ops);
+my ($opt_cluster, $opt_node_id, $opt_adv_host);
 
 GetOptions(
-    'config=s'    => \$config_path,
-    'host=s'      => \$opt_host,
-    'port=i'      => \$opt_port,
-    'db-driver=s' => \$opt_driver,
-    'ops-host=s'  => \$opt_ops_host,
-    'ops-port=i'  => \$opt_ops_port,
-    'no-ops!'     => \$opt_no_ops,
-) or die "Usage: $0 [--config path] [--host addr] [--port N] [--db-driver sqlite|db2|informix] [--ops-port N] [--no-ops]\n";
+    'config=s'         => \$config_path,
+    'host=s'           => \$opt_host,
+    'port=i'           => \$opt_port,
+    'db-driver=s'      => \$opt_driver,
+    'ops-host=s'       => \$opt_ops_host,
+    'ops-port=i'       => \$opt_ops_port,
+    'no-ops!'          => \$opt_no_ops,
+    'cluster!'         => \$opt_cluster,
+    'node-id=s'        => \$opt_node_id,
+    'advertise-host=s' => \$opt_adv_host,
+) or die "Usage: $0 [--config path] [--host addr] [--port N] [--db-driver sqlite|db2|informix] [--ops-port N] [--no-ops] [--cluster] [--node-id id] [--advertise-host host]\n";
 
 open(my $cfh, '<', $config_path) or die "Cannot open config $config_path: $!\n";
 my $raw_cfg = do { local $/; <$cfh> };
@@ -492,6 +562,16 @@ $cfg->{ops}{port}   = $opt_ops_port if defined $opt_ops_port;
 $cfg->{ops}{port}   = 0             if $opt_no_ops;
 $cfg->{db}{driver}  = $opt_driver   if defined $opt_driver;
 $cfg->{db}{driver}  = $ENV{SHOP_DB_DRIVER} if defined $ENV{SHOP_DB_DRIVER} && length($ENV{SHOP_DB_DRIVER});
+$cfg->{keydb}{host} = $ENV{KEYDB_HOST}     if defined $ENV{KEYDB_HOST} && length($ENV{KEYDB_HOST});
+$cfg->{keydb}{port} = int($ENV{KEYDB_PORT}) if defined $ENV{KEYDB_PORT} && length($ENV{KEYDB_PORT});
+$cfg->{cluster} ||= {};
+$cfg->{cluster}{enabled}        = $opt_cluster ? 1 : 0 if defined $opt_cluster;
+$cfg->{cluster}{node_id}        = $opt_node_id         if defined $opt_node_id;
+$cfg->{cluster}{advertise_host} = $opt_adv_host        if defined $opt_adv_host;
+if (!defined $cfg->{cluster}{node_id} || !length($cfg->{cluster}{node_id})) {
+    my $hn = eval { hostname() } || 'node';
+    $cfg->{cluster}{node_id} = $hn . ':' . ($cfg->{ssh}{port} // 2222);
+}
 if (defined $ENV{SHOP_ADMIN_FP} && length($ENV{SHOP_ADMIN_FP})) {
     push @{ $cfg->{admin_fingerprints} }, split(/,/, $ENV{SHOP_ADMIN_FP});
 }
@@ -522,7 +602,7 @@ if (!$prods || !@$prods) {
     $db->init_schema($schema, $seed);
 }
 
-# 3. Lock-free Metrics, Hot Inventory (MT::SharedHash + per-SKU MT::Cell) & EventBus
+# 3. Lock-free Metrics, Hot Inventory (MT::SharedHash + per-SKU MT::Cell), EventBus & DoS Blackhole
 my $metrics   = Shop::Metrics->new();
 my $inventory = Shop::State::Inventory->new(metrics => $metrics);
 my $loaded    = $inventory->load_from_db($db);
@@ -531,14 +611,23 @@ if (-f $ckpt_path) {
     warn "[shop-server] checkpoint restore note: $@" if $@;
 }
 my $event_bus = Shop::State::EventBus->new();
+my $blackhole = Shop::Cluster::Blackhole->new(
+    ban_ttl       => $cfg->{cluster}{ban_ttl}       // 300,
+    strike_limit  => $cfg->{cluster}{strike_limit}  // 3,
+    strike_window => $cfg->{cluster}{strike_window} // 60,
+    mode          => $cfg->{cluster}{blackhole_mode} // 'drop',
+    kernel_cmd    => $cfg->{cluster}{kernel_cmd}    // '',
+);
 
 my $inv_ids = $inventory->state_ids();
 my $eb_ids  = $event_bus->state_ids();
 my $m_ids   = $metrics->state_ids();
+my $bh_ids  = $blackhole->state_ids();
 
-# Shared shutdown flag and incoming client fd channel
-my $shutdown_cell = MT::Cell->new(0);
-my $conn_chan     = MT::Channel->new(1024);
+# Shared shutdown flag, cluster status snapshot cell, and incoming client fd channel
+my $shutdown_cell     = MT::Cell->new(0);
+my $cluster_snap_cell = MT::Cell->new('');
+my $conn_chan         = MT::Channel->new(1024);
 
 # Register MT::Fault observer
 MT::Fault::on(sub {
@@ -553,7 +642,8 @@ Shop::Webhook::Server::prepare_for_freeze();
 Mojo::MT::prepare_for_freeze() if defined &Mojo::MT::prepare_for_freeze;
 MT::Image::freeze();
 
-my $cfg_json = MT::Pool::_encode_list($cfg);
+my $cfg_json    = MT::Pool::_encode_list($cfg);
+my $bh_ids_blob = MT::Pool::_encode_list($bh_ids);
 
 # 5. Spawn supervised DB MT::Pool
 my $db_pool = MT::Pool->new(
@@ -569,7 +659,8 @@ push @workers, MT::Worker::spawn(
 push @workers, MT::Worker::spawn(
     'Shop::Server::reaper_worker',
     $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id},
-    $eb_ids->{sessions_id}, $eb_ids->{free_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
+    $eb_ids->{sessions_id}, $eb_ids->{free_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id},
+    $bh_ids_blob, $shutdown_cell->id
 );
 
 my $ops_port = defined($cfg->{ops}{port}) ? int($cfg->{ops}{port}) : 8088;
@@ -578,7 +669,8 @@ if ($ops_port > 0) {
     push @workers, MT::Worker::spawn(
         'Shop::Server::ops_worker',
         $cfg_json, $inv_ids->{products_id}, $inv_ids->{cells_id},
-        $eb_ids->{sessions_id}, $eb_ids->{free_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id}, $shutdown_cell->id
+        $eb_ids->{sessions_id}, $eb_ids->{free_id}, $m_ids->{cells_id}, $m_ids->{ratelimit_id},
+        $bh_ids_blob, $cluster_snap_cell->id, $shutdown_cell->id
     );
 }
 
@@ -591,15 +683,53 @@ for my $idx (1 .. $n_sess) {
         $inv_ids->{products_id}, $inv_ids->{cells_id},
         $eb_ids->{sessions_id}, $eb_ids->{free_id},
         $m_ids->{cells_id}, $m_ids->{ratelimit_id},
+        $bh_ids_blob, $cluster_snap_cell->id,
         $conn_chan->id,
         $shutdown_cell->id
     );
 }
 
-# 8. Start non-blocking SSH TCP listener
-my $listen_host = $cfg->{ssh}{host} // '0.0.0.0';
-my $listen_port = $cfg->{ssh}{port} // 2222;
-my $rate_limit  = $cfg->{ssh}{rate_limit_per_min} // 60;
+# 8. Start non-blocking SSH TCP listener (plus optional Cooperative Cluster Mesh)
+my $listen_host     = $cfg->{ssh}{host} // '0.0.0.0';
+my $listen_port     = $cfg->{ssh}{port} // 2222;
+my $rate_limit      = $cfg->{ssh}{rate_limit_per_min} // 60;
+my $cluster_enabled = $cfg->{cluster}{enabled} ? 1 : 0;
+
+my $main_kdb = eval {
+    my $k = Shop::Cache::KeyDB->new(
+        host   => $cfg->{keydb}{host}   // '127.0.0.1',
+        port   => $cfg->{keydb}{port}   // 6379,
+        prefix => $cfg->{keydb}{prefix} // 's:',
+    );
+    $k->ping() ? $k : undef;
+};
+
+my $mesh;
+my $sync_interval_sec = (($cfg->{cluster}{sync_interval_ms} // 500) + 0) / 1000.0;
+$sync_interval_sec = 0.05 if $sync_interval_sec < 0.05;
+if ($cluster_enabled) {
+    my $adv_host = $cfg->{cluster}{advertise_host};
+    if (!defined $adv_host || !length($adv_host)) {
+        $adv_host = ($listen_host eq '0.0.0.0' || $listen_host eq '::') ? '127.0.0.1' : $listen_host;
+    }
+    $mesh = Shop::Cluster::Mesh->new(
+        node_id      => $cfg->{cluster}{node_id},
+        host         => $adv_host,
+        port         => $listen_port,
+        keydb        => $main_kdb,
+        blackhole    => $blackhole,
+        metrics      => $metrics,
+        max_sessions => $cfg->{cluster}{max_sessions} // 1000,
+        node_ttl     => $cfg->{cluster}{node_ttl}     // 10,
+    );
+    eval { $mesh->register(0) };
+    my $init_st = eval { $mesh->sync_tick(0) };
+    if (ref($init_st) eq 'HASH') {
+        $cluster_snap_cell->set(encode_json($init_st));
+    }
+    $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+}
+
 my $server = IO::Socket::INET->new(
     LocalAddr => $listen_host,
     LocalPort => $listen_port,
@@ -618,12 +748,17 @@ $SIG{PIPE} = 'IGNORE';
 
 $| = 1;
 my $ops_msg = $ops_port > 0
-    ? "http://$ops_host:$ops_port (/healthz, /metrics, /api/catalog, /api/memberships, /webhooks/stripe, /webhooks/shippo)"
+    ? "http://$ops_host:$ops_port (/healthz, /metrics, /api/catalog, /api/memberships, /api/cluster, /webhooks/stripe, /webhooks/shippo)"
+    : "disabled";
+my $cluster_msg = $cluster_enabled
+    ? "enabled(node=$cfg->{cluster}{node_id})"
     : "disabled";
 print "[shop-server] Listening on ssh://$listen_host:$listen_port "
-    . "(db=" . $db->driver() . ", products=$loaded, session_workers=$n_sess, kex=mlkem768x25519-sha256, compression=zlib\@openssh.com, ops=$ops_msg)\n";
+    . "(db=" . $db->driver() . ", products=$loaded, session_workers=$n_sess, kex=mlkem768x25519-sha256, compression=zlib\@openssh.com, cluster=$cluster_msg, ops=$ops_msg)\n";
 
-my $last_sup_tick = time();
+my $last_sup_tick  = time();
+my $last_sync_tick = time();
+my $conn_seq       = 0;
 while (!$stop) {
     my $accepted = 0;
     while ($accepted < 64 && !$stop) {
@@ -631,17 +766,45 @@ while (!$stop) {
         last unless $client;
         $accepted++;
         my $peer_ip = eval { $client->peerhost() } || 'unknown';
+
+        # 1. Pre-fiber O(1) DoS blackhole check (0 fibers, 0 B egress)
+        if ($blackhole->is_banned($peer_ip)) {
+            $blackhole->shunt_socket($client, $peer_ip);
+            $metrics->inc('ssh_dos_blackholed_total', 1);
+            next;
+        }
+
+        # 2. Pre-auth per-IP rate limiter
         if ($rate_limit > 0 && !$metrics->check_rate_limit($peer_ip, $rate_limit)) {
+            $blackhole->record_violation($peer_ip, 'rate_limit', 1, $main_kdb);
+            $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
             close($client);
-        } else {
-            setsockopt($client, SOL_SOCKET, SO_KEEPALIVE, 1);
-            $metrics->inc('ssh_connections_total', 1);
-            my $raw_fd = fileno($client);
-            my $dup_fd = defined($raw_fd) ? POSIX::dup($raw_fd) : undef;
-            close($client);
-            if (defined $dup_fd && $dup_fd >= 0) {
-                $conn_chan->send($dup_fd);
+            next;
+        }
+
+        setsockopt($client, SOL_SOCKET, SO_KEEPALIVE, 1);
+        $metrics->inc('ssh_connections_total', 1);
+
+        # 3. Cooperative cluster wavefunction routing (raw L4 relay if remote)
+        if ($cluster_enabled && $mesh) {
+            $conn_seq++;
+            my ($target, $is_local) = $mesh->choose_node($peer_ip, $conn_seq);
+            if (!$is_local && ref($target) eq 'HASH' && defined $target->{host} && defined $target->{port}) {
+                my $raw_fd = fileno($client);
+                my $dup_fd = defined($raw_fd) ? POSIX::dup($raw_fd) : undef;
+                close($client);
+                if (defined $dup_fd && $dup_fd >= 0) {
+                    $conn_chan->send("RELAY:$dup_fd:$target->{host}:$target->{port}");
+                }
+                next;
             }
+        }
+
+        my $raw_fd = fileno($client);
+        my $dup_fd = defined($raw_fd) ? POSIX::dup($raw_fd) : undef;
+        close($client);
+        if (defined $dup_fd && $dup_fd >= 0) {
+            $conn_chan->send("LOCAL:$dup_fd:$peer_ip");
         }
     }
     if ($accepted == 0) {
@@ -653,9 +816,18 @@ while (!$stop) {
         MT::Supervisor::tick();
         $last_sup_tick = $now;
     }
+    if ($cluster_enabled && $mesh && ($now - $last_sync_tick >= $sync_interval_sec)) {
+        my $st = eval { $mesh->sync_tick($metrics->get('ssh_active_sessions')) };
+        if (ref($st) eq 'HASH') {
+            $cluster_snap_cell->set(encode_json($st));
+        }
+        $metrics->set('ssh_dos_banned_ips', $blackhole->stats()->{banned_ips});
+        $last_sync_tick = $now;
+    }
 }
 
 print "\n[shop-server] Shutting down cleanly...\n";
+eval { $mesh->unregister() } if $mesh;
 $shutdown_cell->set(1);
 close($server);
 $conn_chan->close();

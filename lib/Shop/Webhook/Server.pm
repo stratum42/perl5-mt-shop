@@ -60,6 +60,9 @@ sub new {
         shutdown_cell         => $opt{shutdown_cell},
         idempotency           => $opt{idempotency}    || MT::SharedHash->new,
         idempotency_max       => defined $opt{idempotency_max} ? int($opt{idempotency_max}) : 10_000,
+        cluster_cell          => $opt{cluster_cell},
+        cluster_enabled       => $opt{cluster_enabled} ? 1 : 0,
+        blackhole             => $opt{blackhole},
         http_engine           => $HAS_MOJO ? 'mojolicious-mt' : 'raw-socket',
         daemon                => undef,
         app                   => undef,
@@ -352,6 +355,9 @@ sub listen {
             shippo_webhook_secret => $self->{shippo_webhook_secret},
             tolerance_sec         => $self->{tolerance_sec},
             idempotency           => $self->{idempotency},
+            cluster_cell          => $self->{cluster_cell},
+            cluster_enabled       => $self->{cluster_enabled},
+            blackhole             => $self->{blackhole},
             http_engine           => $self->{http_engine},
         );
 
@@ -538,6 +544,35 @@ sub handle_request {
             ok    => \1,
             count => scalar(@tiers),
             tiers => \@tiers,
+        });
+    }
+
+    if ($method eq 'GET' && $path eq '/api/cluster') {
+        my $snapshot = {};
+        if ($self->{cluster_cell}) {
+            my $raw = eval { $self->{cluster_cell}->get };
+            if (defined $raw && length $raw) {
+                my $dec = eval { decode_json($raw) };
+                $snapshot = $dec if ref($dec) eq 'HASH';
+            }
+        }
+        my $bh_stats = {};
+        if ($self->{blackhole}) {
+            my $st = eval { $self->{blackhole}->stats };
+            $bh_stats = $st if ref($st) eq 'HASH';
+        }
+        elsif ($self->{metrics}) {
+            $bh_stats = {
+                blackholed_total => $self->{metrics}->get('ssh_dos_blackholed_total'),
+                banned_ips       => $self->{metrics}->get('ssh_dos_banned_ips'),
+                mode             => 'drop',
+            };
+        }
+        return _json_response(200, 'OK', {
+            ok        => \1,
+            enabled   => $self->{cluster_enabled} ? 1 : 0,
+            cluster   => $snapshot,
+            blackhole => $bh_stats,
         });
     }
 

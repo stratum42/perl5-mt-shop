@@ -44,6 +44,19 @@ Default settings in `config/shop.json`:
     "port": 6379,
     "prefix": "s:"
   },
+  "cluster": {
+    "enabled": false,
+    "node_id": "",
+    "advertise_host": "127.0.0.1",
+    "max_sessions": 1000,
+    "node_ttl": 10,
+    "sync_interval_ms": 500,
+    "ban_ttl": 300,
+    "strike_limit": 3,
+    "strike_window": 60,
+    "blackhole_mode": "drop",
+    "kernel_cmd": ""
+  },
   "checkpoint": {
     "path": "var/inventory.mtck"
   },
@@ -66,7 +79,10 @@ bin/shop-server \
   [--db-driver sqlite|db2|informix] \
   [--ops-host addr] \
   [--ops-port N] \
-  [--no-ops]
+  [--no-ops] \
+  [--cluster] \
+  [--node-id id] \
+  [--advertise-host host]
 ```
 
 - `--config`: Path to JSON config file (default `config/shop.json`).
@@ -76,6 +92,11 @@ bin/shop-server \
   port.
 - `--no-ops`: Disable the embedded HTTP ops/webhook worker (equivalent to
   `--ops-port 0`).
+- `--cluster`: Enable cooperative multi-node clustering over KeyDB (disabled by
+  default).
+- `--node-id`: Unique cluster node identifier (defaults to `<hostname>:<port>`).
+- `--advertise-host`: Hostname or IP advertised to peer nodes for L4 TCP
+  forwarding.
 
 ## Environment Variables
 
@@ -137,11 +158,16 @@ When `ops.port > 0` (default `127.0.0.1:8088`), `Shop::Webhook::Server` runs
   - `ssh_egress_full_bytes`, `ssh_egress_diff_bytes`, `ssh_egress_wire_bytes`
   - `inventory_cas_ok_total`, `inventory_cas_conflict_total`
   - `orders_total`, `webhooks_processed_total`, `supervisor_faults_total`
+  - `cluster_nodes_active`, `cluster_wave_step`, `cluster_coherence_ok`,
+    `cluster_relayed_total`, `ssh_dos_blackholed_total`, `ssh_dos_banned_ips`
 - `GET /api/catalog`: Returns `200 OK` JSON (`{"ok":true,"count":N,"items":[...]}`)
   from the in-process hot `Shop::State::Inventory` (supports optional
   `category` and `q` query parameters).
 - `GET /api/memberships`: Returns `200 OK` JSON (`{"ok":true,"count":N,"tiers":[...]}`)
   listing active membership tiers and benefits.
+- `GET /api/cluster`: Returns `200 OK` JSON
+  (`{"ok":true,"enabled":0|1,"cluster":{...},"blackhole":{...}}`) with the
+  latest lock-free cluster wavefunction snapshot and DoS blackhole statistics.
 - `POST /webhooks/stripe`: Verifies the `Stripe-Signature` header
   (`t=<ts>,v1=<hex>`) using constant-time HMAC-SHA256 with a 300-second
   timestamp tolerance, checks an `MT::SharedHash` idempotency store, updates

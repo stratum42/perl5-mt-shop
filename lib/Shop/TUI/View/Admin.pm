@@ -702,6 +702,48 @@ sub _draw_dashboard {
         $sstats->{ready}  // 0, $sstats->{parked} // 0, $sstats->{ticks} // 0), $pal->{normal}, $w);
     $scr->write_str($x, $py++, sprintf("MT::Supervisor      : %d healthy, %d faulted | MT::Fault=%d | DB=%s",
         $alive_units, $faulted_units, $faults, ($app->{db} ? $app->{db}->driver() : 'none')), $faulted_units ? $pal->{err} : $pal->{ok}, $w);
+
+    # Cluster Wavefunction & DoS Blackhole telemetry
+    my $cl_cfg   = (ref($app->{config}) eq 'HASH' && ref($app->{config}{cluster}) eq 'HASH')
+        ? $app->{config}{cluster}
+        : {};
+    my $cl_snap  = {};
+    if ($app->{cluster_cell} && $app->{cluster_cell}->can('get')) {
+        my $raw = eval { $app->{cluster_cell}->get };
+        if (defined $raw && length $raw) {
+            my $dec = eval { require Shop::Domain::JSON; Shop::Domain::JSON::decode_json($raw) };
+            $cl_snap = $dec if ref($dec) eq 'HASH';
+        }
+    } elsif (defined $cl_cfg->{_snap_cell_id}) {
+        my $cell = $self->{_cluster_cell_cache} ||= eval { require MT::Cell; MT::Cell->attach($cl_cfg->{_snap_cell_id}) };
+        if ($cell) {
+            my $raw = eval { $cell->get };
+            if (defined $raw && length $raw) {
+                my $dec = eval { require Shop::Domain::JSON; Shop::Domain::JSON::decode_json($raw) };
+                $cl_snap = $dec if ref($dec) eq 'HASH';
+            }
+        }
+    }
+    if ($py < $y + $h && ($cl_cfg->{enabled} || %$cl_snap || ($gm->{cluster_nodes_active} // 0) > 0)) {
+        my $c_step   = defined $cl_snap->{step} ? int($cl_snap->{step}) : int($gm->{cluster_wave_step} // 0);
+        my $c_nodes  = defined $cl_snap->{dim}  ? int($cl_snap->{dim})  : int($gm->{cluster_nodes_active} // 0);
+        my $c_coh_ok = defined $cl_snap->{coherence_ok} ? $cl_snap->{coherence_ok} : ($gm->{cluster_coherence_ok} // 1);
+        my $c_coh    = $c_coh_ok ? 'OK' : 'DRIFT';
+        my $c_dig    = defined $cl_snap->{digest} && length($cl_snap->{digest}) ? substr($cl_snap->{digest}, 0, 12) : '-';
+        my $c_rel    = int($gm->{cluster_relayed_total} // 0);
+        $scr->write_str($x, $py++, sprintf("Cluster Wavefunction: step=%d, %d nodes, coherence=%s, digest=%s | relayed=%d",
+            $c_step, $c_nodes, $c_coh, $c_dig, $c_rel), $c_coh_ok ? $pal->{ok} : $pal->{err}, $w);
+    }
+    my $bh_tot = int($gm->{ssh_dos_blackholed_total} // 0);
+    my $bh_ban = int($gm->{ssh_dos_banned_ips}       // 0);
+    if (ref($cl_snap->{blackhole}) eq 'HASH') {
+        $bh_tot = int($cl_snap->{blackhole}{blackholed_total} // $bh_tot) if $bh_tot == 0;
+        $bh_ban = int($cl_snap->{blackhole}{banned_ips}       // $bh_ban) if $bh_ban == 0;
+    }
+    if ($py < $y + $h) {
+        $scr->write_str($x, $py++, sprintf("DoS Blackholed      : %d (%d banned IPs)",
+            $bh_tot, $bh_ban), $bh_ban > 0 ? $pal->{warn} : $pal->{normal}, $w);
+    }
     $py++;
 
     # Egress Telemetry (Global Shop::Metrics + This Session)
@@ -722,11 +764,17 @@ sub _draw_dashboard {
     my $g_wire = $gm->{ssh_egress_wire_bytes} || 0;
     my $g_save = $g_full > 0 ? sprintf('%.1f%%', 100.0 * (1 - $g_wire / $g_full)) : '0.0%';
 
-    $scr->write_str($x, $py++, "=== EGRESS TELEMETRY (Session & Global Shop::Metrics) ===", $pal->{title}, $w);
-    $scr->write_str($x, $py++, sprintf("Session Full ANSI   : %8d B  (%d frames, %d idle skipped)",
-        $full_b, $sm->{frames_rendered}, $sm->{empty_frames_skipped}), $pal->{normal}, $w);
-    $scr->write_str($x, $py++, sprintf("Session Diff / Wire : %8d B diff (%s) -> %8d B %s (%s | TOT: %s)",
-        $diff_b, $diff_save, $wire_b, $comp, $zlib_save, $tot_save), $pal->{price}, $w);
+    if ($py < $y + $h) {
+        $scr->write_str($x, $py++, "=== EGRESS TELEMETRY (Session & Global Shop::Metrics) ===", $pal->{title}, $w);
+    }
+    if ($py < $y + $h) {
+        $scr->write_str($x, $py++, sprintf("Session Full ANSI   : %8d B  (%d frames, %d idle skipped)",
+            $full_b, $sm->{frames_rendered}, $sm->{empty_frames_skipped}), $pal->{normal}, $w);
+    }
+    if ($py < $y + $h) {
+        $scr->write_str($x, $py++, sprintf("Session Diff / Wire : %8d B diff (%s) -> %8d B %s (%s | TOT: %s)",
+            $diff_b, $diff_save, $wire_b, $comp, $zlib_save, $tot_save), $pal->{price}, $w);
+    }
     if ($py < $y + $h) {
         $scr->write_str($x, $py++, sprintf("Global All Sessions : %8d B full -> %8d B diff -> %8d B wire (SAVED: %s)",
             $g_full, $g_diff, $g_wire, $g_save), $pal->{ok}, $w);

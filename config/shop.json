@@ -34,6 +34,19 @@
     "port": 6379,
     "prefix": "s:"
   },
+  "cluster": {
+    "enabled": false,
+    "node_id": "",
+    "advertise_host": "127.0.0.1",
+    "max_sessions": 1000,
+    "node_ttl": 10,
+    "sync_interval_ms": 500,
+    "ban_ttl": 300,
+    "strike_limit": 3,
+    "strike_window": 60,
+    "blackhole_mode": "drop",
+    "kernel_cmd": ""
+  },
   "checkpoint": {
     "path": "var/inventory.mtck"
   },
