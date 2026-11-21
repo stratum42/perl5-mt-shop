@@ -25,9 +25,10 @@ terminal UI.
   decimal128, `ROUND_HALF_UP`).
 - Signed order receipts (SHA-256 over canonical JSON, signed with the server's
   Ed25519 host key).
-- Three storage drivers: SQLite (default local mode), IBM Db2 Community Edition,
-  and IBM Informix, plus optional KeyDB for cart leases, session resume, and
-  rate/quote caching.
+- Three storage drivers: SQLite (default local mode), IBM Db2 Community Edition
+  (51 static SQL PL stored procedures), and IBM Informix (67 static SPL
+  procedures and triggers, including 51 `shop_sp_*` procedures), plus optional
+  KeyDB for cart leases, session resume, and rate/quote caching.
 - Multi-warehouse fulfillment routing (`DAL1`, `NYC1`, `SFO1`), inbound
   purchase order receiving, Shippo carrier rate quotes and labels, and
   state-level tax nexus calculation.
@@ -66,7 +67,7 @@ terminal UI.
 # Build the XS crypto/zlib extension and generate config/host_ed25519_key
 make crypto hostkey
 
-# Run the test suite
+# Run the test suite (14 suites: t/01_crypto.t through t/14_cluster_wavefunction_blackhole.t)
 make test
 
 # Start the SSH storefront (:2222) and ops HTTP server (:8088)

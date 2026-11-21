@@ -16,7 +16,8 @@ Default settings in `config/shop.json`:
     "host_key": "config/host_ed25519_key",
     "allow_guest": true,
     "compression_level": 5,
-    "rate_limit_per_min": 60
+    "rate_limit_per_min": 60,
+    "idle_timeout_sec": 1800
   },
   "ops": {
     "host": "127.0.0.1",
@@ -170,13 +171,15 @@ When `ops.port > 0` (default `127.0.0.1:8088`), `Shop::Webhook::Server` runs
   latest lock-free cluster wavefunction snapshot and DoS blackhole statistics.
 - `POST /webhooks/stripe`: Verifies the `Stripe-Signature` header
   (`t=<ts>,v1=<hex>`) using constant-time HMAC-SHA256 with a 300-second
-  timestamp tolerance, checks an `MT::SharedHash` idempotency store, updates
+  timestamp tolerance, checks webhook idempotency (KeyDB with a bounded
+  in-process `MT::SharedHash` fallback capped at 10,000 entries), updates
   order, membership, or subscription status in the database (including
   `invoice.paid`, `customer.subscription.updated`, and
   `customer.subscription.deleted`), and pushes a notification to the buyer's
   open SSH session via `EventBus`.
 - `POST /webhooks/shippo`: Verifies the HMAC-SHA256 signature against
-  `SHIPPO_WEBHOOK_SECRET`, maps carrier tracking events (`PRE_TRANSIT`,
+  `SHIPPO_WEBHOOK_SECRET`, enforces idempotency (KeyDB with the same bounded
+  10,000-entry fallback), maps carrier tracking events (`PRE_TRANSIT`,
   `TRANSIT`/`IN_TRANSIT`, `OUT_FOR_DELIVERY`, `DELIVERED`,
   `RETURNED`/`FAILURE`) to shipment and order statuses, updates the database,
   and pushes live tracking updates to active SSH sessions via `EventBus`.
@@ -206,7 +209,7 @@ In the Admin view (`5`), press `l` or `L` to open the `[L] Logistics` sub-tab:
      counts against `tax_nexus` thresholds (`REGISTERED`, `NEXUS_REQUIRED`,
      `APPROACHING`, `OK`).
 
-## Scheduled Subscription Renewals
+## Scheduled Subscription Renewals and Maintenance
 
 `Shop::Server::reaper_worker` runs `Shop::Domain::Subscription::process_due_renewals()`
 on a periodic timer (controlled by `workers.renewal_interval_sec`, default 60 s).
@@ -214,6 +217,9 @@ Each due cycle acquires an idempotency lock (`sub:renew:<id>:<next_bill_at>`) in
 KeyDB (or in-process fallback) so a billing cycle is never double-billed, places
 the renewal order via `Shop::Domain::Checkout::quick_reorder`, advances
 `next_bill_at`, and pushes a `subscription_renewed` notification over `EventBus`.
+`reaper_worker` also pings KeyDB (which reconnects automatically on connection
+errors) and runs `prune_rate_limits` and expired blackhole ban pruning every
+60 s.
 
 ## Shutdown and Checkpoints
 
@@ -225,7 +231,7 @@ shuts down the DB worker pool.
 ## Running Tests and Benchmarks
 
 ```sh
-# Local test suite (no Docker required; Docker-only checks skip cleanly)
+# Local test suite (14 suites: t/01_crypto.t through t/14_cluster_wavefunction_blackhole.t; Docker-only checks skip cleanly)
 make test
 
 # Full test suite including live Db2, Informix, and KeyDB containers

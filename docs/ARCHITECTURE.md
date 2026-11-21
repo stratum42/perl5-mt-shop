@@ -15,29 +15,38 @@ worker threads:
    inventory is loaded into shared state. `Mojo::MT::prepare_for_freeze()` and
    `MT::Image::freeze()` are called once before any worker thread is spawned so
    the compiled optrees and read-only structures are shared across threads.
-2. **Acceptor Loop (Main Thread)**: A non-blocking TCP listener accepts
-   connections on `ssh.host:ssh.port` (default `0.0.0.0:2222`), checks the
-   in-process per-IP rate limiter, duplicates the client file descriptor via
-   `POSIX::dup`, and sends the fd over a bounded `MT::Channel` (capacity 256).
-   Every 250 ms it calls `MT::Supervisor::tick()`.
+2. **Acceptor Loop (Main Thread)**: A non-blocking TCP listener (`Listen =>
+   1024`) accepts connections on `ssh.host:ssh.port` (default `0.0.0.0:2222`),
+   checks the pre-fiber DoS blackhole and in-process per-IP rate limiter,
+   enables `SO_KEEPALIVE` on accepted sockets, duplicates the client file
+   descriptor via `POSIX::dup`, and sends the fd over a bounded `MT::Channel`
+   (capacity 256). Every 250 ms it calls `MT::Supervisor::tick()`.
 3. **Session Workers and Stackful Fibers**: `workers.session_workers` (default
    4) `MT::Worker` OS threads pull client fds from the connection channel.
-   Inside each worker, a dispatcher fiber spawns one `MT::Fiber` per SSH
-   connection. Fibers run cooperatively on a configurable stack
-   (`MT_FIBER_STACK`, tested at 32 KiB / `32768` bytes), yielding around
-   non-blocking socket I/O and inbox checks.
+   Inside each worker, a dispatcher fiber uses a per-worker `IO::Poll` loop to
+   spawn one `MT::Fiber` per SSH connection and wake parked fibers
+   (`MT::Fiber::park()`) when their socket or EventBus inbox is ready. Fibers
+   run cooperatively on a configurable stack (`MT_FIBER_STACK`, tested at 32
+   KiB / `32768` bytes) and disconnect inactive sessions after
+   `ssh.idle_timeout_sec` (default 1800 s).
 4. **Background Workers**:
    - `db_pool` (`MT::Pool`, default 2 workers): database worker pool.
    - `checkpoint_worker`: writes `MT::Checkpoint` inventory snapshots on a
      fixed interval (`workers.checkpoint_interval_sec`, default 30 s).
-   - `reaper_worker`: periodic KeyDB health ping and background maintenance.
+   - `reaper_worker`: periodic KeyDB health ping (with automatic reconnect on
+     connection errors), scheduled subscription renewals, `prune_rate_limits`
+     every 60 s, and expired blackhole ban pruning.
    - `ops_worker`: non-blocking HTTP/1.1 server (`Shop::Webhook::Server`) that
      instantiates `Shop::Web::App` on `Mojo::Server::Daemon` +
      `Mojo::Reactor::MT` + `Mojo::MT::Accel` inside the frozen worker thread
      (with a raw-socket `select()` fallback if `mojolicious-mt` is absent),
-     serving `/healthz`, `/metrics`, `/api/catalog`, and webhook endpoints. A
-     50 ms recurring `Mojo::IOLoop` timer calls `MT::Supervisor::beat()` and
-     polls the shared shutdown `MT::Cell` for clean `SIGINT`/`SIGTERM` exit.
+     serving `GET /healthz`, `GET /metrics`, `GET /api/catalog`,
+     `GET /api/memberships`, `GET /api/cluster`, `POST /webhooks/stripe`, and
+     `POST /webhooks/shippo`. Webhook idempotency uses KeyDB when available
+     with a bounded in-process `MT::SharedHash` fallback (capped at 10,000
+     entries). A 50 ms recurring `Mojo::IOLoop` timer calls
+     `MT::Supervisor::beat()` and polls the shared shutdown `MT::Cell` for
+     clean `SIGINT`/`SIGTERM` exit.
 5. **Fault Observation**: `MT::Fault::on` logs worker faults and increments
    `supervisor_faults_total` in `Shop::Metrics`.
 
@@ -106,9 +115,12 @@ every keypress:
   $nxt)`. Workers attach to both shared hashes by ID after `MT::Image::freeze`.
 - **EventBus (`Shop::State::EventBus`)**: Active SSH sessions register their
   metadata and an inbox `MT::Channel` ID (default capacity 64) in a shared
-  hash. `broadcast()` and `send_to_user()` deliver JSON payloads non-blockingly
-  (dropping if a slow receiver's channel is at `cap - 1`) for stock updates,
-  admin broadcasts, payment confirmations, and shipment tracking updates.
+  hash. On disconnect, `unregister_session()` drains the inbox channel and
+  recycles its ID into a shared free-channel pool so session churn reuses
+  existing channels without unbounded growth. `broadcast()` and `send_to_user()`
+  deliver JSON payloads non-blockingly (dropping if a slow receiver's channel
+  is at `cap - 1`) for stock updates, admin broadcasts, payment confirmations,
+  and shipment tracking updates.
 - **Checkpoints (`MT::Checkpoint`)**: `checkpoint_worker` periodically persists
   the inventory state to `checkpoint.path` (`var/inventory.mtck`), and a final
   snapshot is written on clean `SIGINT`/`SIGTERM` shutdown. On startup, the

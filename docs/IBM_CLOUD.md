@@ -48,7 +48,7 @@ Comparing the full production stack (not just the database line item):
 
 - **Where IBM Cloud Db2 Standard fits well**:
   - Includes 2 vCPU and 8 GiB RAM at the $99/month base tier, along with 100 GB of backup storage.
-  - Supports `DECFLOAT(34)` (exact 34-digit IEEE 754-2008 decimal128 matching `MT::Decimal`), `SYSTEM_TIME` temporal history tables, `SELECT FROM FINAL TABLE`, `MERGE INTO`, `GROUP BY ROLLUP`, and static compiled SQL PL stored procedures (`DB2_SP_ONLY=1`).
+  - Supports `DECFLOAT(34)` (exact 34-digit IEEE 754-2008 decimal128 matching `MT::Decimal`), `SYSTEM_TIME` temporal history tables, `SELECT FROM FINAL TABLE`, `MERGE INTO`, `GROUP BY ROLLUP`, and 51 static compiled SQL PL stored procedures (`DB2_SP_ONLY=1`).
 - **Where PlanetScale fits well**:
   - Lower entry floor (~$39/month) if you only need a very small HA MySQL/Vitess cluster (1 GiB RAM, 10 GB storage).
   - Built-in schema branching, non-blocking online DDL, and horizontal Vitess sharding if the workload grows beyond a single database node.
@@ -189,7 +189,7 @@ chmod 600 docker/.env
 # Start only the lightweight loopback db2-gateway and KeyDB (no local Db2 container needed)
 docker compose -f docker/docker-compose.yml up -d --build db2-gateway keydb
 
-# Bootstrap schema, 42 static SQL PL stored procedures, and seed data
+# Bootstrap schema, 51 static SQL PL stored procedures, and seed data
 DB2_ADMIN_KEY=<strong-random-admin-key> ./docker/init-db2.sh
 ```
 

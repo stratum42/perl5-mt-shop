@@ -9,8 +9,8 @@
 | Driver | Module | Schema | Stored Procedures | Transport |
 |---|---|---|---|---|
 | `sqlite` | `Shop::DB::SQLite` | `sql/schema_sqlite.sql` | N/A (local embedded) | Direct SQLite file (`var/shop.db`) |
-| `db2` | `Shop::DB::Db2` | `sql/schema_db2.sql` | `sql/procs_db2.sql` (51 SQL PL procs) | HTTP gateway (`127.0.0.1:50050`) -> Db2 (`:50000`) |
-| `informix` | `Shop::DB::Informix` | `sql/schema_informix.sql` | `sql/procs_informix.sql` (51 SPL procs) | HTTP gateway (`127.0.0.1:50051`) -> Informix DRDA (`:9089`) |
+| `db2` | `Shop::DB::Db2` | `sql/schema_db2.sql` | `sql/procs_db2.sql` (51 static SQL PL procs) | HTTP gateway (`127.0.0.1:50050`) -> Db2 (`:50000`) |
+| `informix` | `Shop::DB::Informix` | `sql/schema_informix.sql` | `sql/procs_informix.sql` (67 static SPL procs/triggers: 51 `shop_sp_*` + 8 audit procs + 8 triggers) | HTTP gateway (`127.0.0.1:50051`) -> Informix DRDA (`:9089`) |
 
 All three schemas share the same core tables:
 `products`, `users`, `addresses`, `promo_codes`, `orders`, `order_items`,
@@ -135,9 +135,10 @@ seed SQL idempotently through `/admin/ddl`, and exit non-zero on failure.
 ## KeyDB
 
 `lib/Shop/Cache/KeyDB.pm` is a pure-Perl RESP2 client with pipelining, key
-prefixing (default `s:`), and Lua `EVALSHA` (with automatic `NOSCRIPT`
-fallback). KeyDB is optional; if unreachable at startup, the server continues
-in-process without it. When available, KeyDB is used for:
+prefixing (default `s:`), automatic reconnect on connection errors, and Lua
+`EVALSHA` (with automatic `NOSCRIPT` fallback). KeyDB is optional; if
+unreachable at startup, the server continues in-process without it and
+reconnects automatically when KeyDB returns. When available, KeyDB is used for:
 
 - Cart reservation leases with TTL (`workers.lease_ttl_sec`, default 900 s).
 - Session state resume on reconnect.
