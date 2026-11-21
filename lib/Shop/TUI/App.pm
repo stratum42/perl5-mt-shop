@@ -84,26 +84,35 @@ sub new {
         is_guest    => 1,
     };
 
+    my $cfg_idle = (ref($args{config}) eq 'HASH' && ref($args{config}{ssh}) eq 'HASH')
+        ? $args{config}{ssh}{idle_timeout_sec}
+        : undef;
+    my $idle_timeout_sec = defined($args{idle_timeout_sec})
+        ? ($args{idle_timeout_sec} + 0)
+        : (defined($cfg_idle) ? ($cfg_idle + 0) : 1800);
+
     my $self = bless {
-        session      => $sess,
-        session_id   => $args{session_id} // ("sess-" . $$ . "-" . int(rand(1_000_000))),
-        config       => $args{config}     || {},
-        db           => $args{db},
-        keydb        => $args{keydb},
-        inventory    => $args{inventory},
-        event_bus    => $args{event_bus},
-        metrics      => $args{metrics},
-        hostkey      => $args{hostkey},
-        cart         => $args{cart},
-        checkout     => $args{checkout},
-        shippo       => $args{shippo},
-        tax_nexus    => $args{tax_nexus},
-        membership   => $args{membership},
-        subscription => $args{subscription},
-        user         => $user,
-        inbox        => $args{inbox},
-        on_idle      => $args{on_idle},
-        _member_tier => '',
+        session          => $sess,
+        session_id       => $args{session_id} // ("sess-" . $$ . "-" . int(rand(1_000_000))),
+        config           => $args{config}     || {},
+        db               => $args{db},
+        keydb            => $args{keydb},
+        inventory        => $args{inventory},
+        event_bus        => $args{event_bus},
+        metrics          => $args{metrics},
+        hostkey          => $args{hostkey},
+        cart             => $args{cart},
+        checkout         => $args{checkout},
+        shippo           => $args{shippo},
+        tax_nexus        => $args{tax_nexus},
+        membership       => $args{membership},
+        subscription     => $args{subscription},
+        user             => $user,
+        inbox            => $args{inbox},
+        on_idle          => $args{on_idle},
+        idle_timeout_sec => $idle_timeout_sec,
+        last_activity    => time(),
+        _member_tier     => '',
 
         screen       => Shop::TUI::Screen->new(cols => $cols, rows => $rows, env => $env),
         input        => Shop::TUI::Input->new(),
@@ -734,6 +743,8 @@ sub run {
         });
     }
 
+    $self->{last_activity} = time();
+
     # Enter alt-screen, hide cursor, enable SGR mouse reporting
     $sess->write_output(Shop::TUI::Screen::init_sequence());
 
@@ -751,6 +762,7 @@ sub run {
         if ($sess->can('poll_resize')) {
             my ($nc, $nr) = $sess->poll_resize();
             if (defined $nc && defined $nr) {
+                $self->{last_activity} = time();
                 if ($self->{screen}->resize($nc, $nr)) {
                     $self->{dirty} = 1;
                     $did_work = 1;
@@ -766,6 +778,7 @@ sub run {
             last;
         }
         if (length($raw)) {
+            $self->{last_activity} = time();
             $did_work = 1;
             my @evs = $self->{input}->parse($raw);
             for my $ev (@evs) {
@@ -783,8 +796,14 @@ sub run {
             }
         }
 
-        # 4. Expire toast/broadcast banners cleanly
+        # 4. Expire toast/broadcast banners cleanly and enforce idle timeout
         my $now = time();
+        if ($self->{idle_timeout_sec} && $self->{idle_timeout_sec} > 0
+            && ($now - $self->{last_activity}) >= $self->{idle_timeout_sec})
+        {
+            $self->{running} = 0;
+            last;
+        }
         if (length($self->{toast_msg}) && $now >= $self->{toast_until}) {
             $self->{toast_msg} = '';
             $self->{dirty} = 1;
@@ -813,6 +832,12 @@ sub run {
                 if (length($self->{broadcast}) && $self->{broadcast_until} > 0) {
                     if (!$next_timer_ts || $self->{broadcast_until} < $next_timer_ts) {
                         $next_timer_ts = $self->{broadcast_until};
+                    }
+                }
+                if ($self->{idle_timeout_sec} && $self->{idle_timeout_sec} > 0) {
+                    my $idle_deadline = $self->{last_activity} + $self->{idle_timeout_sec};
+                    if (!$next_timer_ts || $idle_deadline < $next_timer_ts) {
+                        $next_timer_ts = $idle_deadline;
                     }
                 }
                 my $sock = $sess->can('sock') ? $sess->sock() : undef;

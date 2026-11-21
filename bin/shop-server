@@ -25,6 +25,7 @@ BEGIN {
 use Getopt::Long qw(GetOptions);
 use JSON::PP qw(encode_json decode_json);
 use IO::Socket::INET;
+use Socket qw(SOL_SOCKET SO_KEEPALIVE);
 use IO::Poll qw(POLLIN POLLHUP POLLERR POLLNVAL);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use POSIX qw(dup);
@@ -180,6 +181,8 @@ sub reaper_worker {
 
     my $renew_interval = $cfg->{workers}{renewal_interval_sec} // 60;
     my $next_renew_at  = time() + $renew_interval;
+    my $prune_interval = 60;
+    my $next_prune_at  = time() + $prune_interval;
 
     while (!$shutdown->get()) {
         MT::Supervisor::beat();
@@ -191,6 +194,11 @@ sub reaper_worker {
             eval { $subscription->process_due_renewals() };
             warn "[reaper] renewal tick error: $@" if $@;
             $next_renew_at = $now + $renew_interval;
+        }
+        if ($now >= $next_prune_at) {
+            eval { $metrics->prune_rate_limits(120) };
+            warn "[reaper] rate-limit prune error: $@" if $@;
+            $next_prune_at = $now + $prune_interval;
         }
         usleep(200_000); # 200ms
     }
@@ -364,21 +372,22 @@ sub session_worker {
                         );
 
                         my $app = Shop::TUI::App->new(
-                            session      => $sess,
-                            session_id   => "w${worker_idx}-fd${client_fd}-" . int(time() * 1000),
-                            config       => $cfg,
-                            db           => $db,
-                            keydb        => $kdb,
-                            inventory    => $inv,
-                            event_bus    => $eb,
-                            metrics      => $metrics,
-                            hostkey      => $hostkey,
-                            cart         => $cart,
-                            checkout     => $checkout,
-                            membership   => $membership,
-                            subscription => $subscription,
-                            user         => $user,
-                            on_idle      => $on_idle,
+                            session          => $sess,
+                            session_id       => "w${worker_idx}-fd${client_fd}-" . int(time() * 1000),
+                            config           => $cfg,
+                            db               => $db,
+                            keydb            => $kdb,
+                            inventory        => $inv,
+                            event_bus        => $eb,
+                            metrics          => $metrics,
+                            hostkey          => $hostkey,
+                            cart             => $cart,
+                            checkout         => $checkout,
+                            membership       => $membership,
+                            subscription     => $subscription,
+                            user             => $user,
+                            on_idle          => $on_idle,
+                            idle_timeout_sec => $cfg->{ssh}{idle_timeout_sec} // 1800,
                         );
                         $app->run();
                     };
@@ -625,6 +634,7 @@ while (!$stop) {
         if ($rate_limit > 0 && !$metrics->check_rate_limit($peer_ip, $rate_limit)) {
             close($client);
         } else {
+            setsockopt($client, SOL_SOCKET, SO_KEEPALIVE, 1);
             $metrics->inc('ssh_connections_total', 1);
             my $raw_fd = fileno($client);
             my $dup_fd = defined($raw_fd) ? POSIX::dup($raw_fd) : undef;

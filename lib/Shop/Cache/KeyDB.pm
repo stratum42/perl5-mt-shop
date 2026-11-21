@@ -187,6 +187,7 @@ sub _read_resp {
 
 sub _write_all {
     my ($sock, $data) = @_;
+    local $SIG{PIPE} = 'IGNORE';
     my $off = 0;
     my $len = length($data);
     while ($off < $len) {
@@ -196,27 +197,63 @@ sub _write_all {
     }
 }
 
+sub _is_conn_error {
+    my ($err) = @_;
+    return 0 unless defined $err && length $err;
+    return 0 if $err =~ /^KEYDB_ERR:/;
+    return ($err =~ /EOF|write failed|Broken pipe|EPIPE|Connection reset|Not connected/i) ? 1 : 0;
+}
+
 sub cmd {
     my ($self, @args) = @_;
-    my $sock = $self->_connect;
-    _write_all($sock, _encode_resp(@args));
-    return $self->_read_resp;
+    my $wire = _encode_resp(@args);
+    for my $attempt (1 .. 2) {
+        my $res;
+        my $ok = eval {
+            my $sock = $self->_connect;
+            _write_all($sock, $wire);
+            $res = $self->_read_resp;
+            1;
+        };
+        return $res if $ok;
+        my $err = $@;
+        if ($attempt == 1 && _is_conn_error($err)) {
+            $self->close();
+            next;
+        }
+        $self->close() if _is_conn_error($err);
+        die $err;
+    }
 }
 
 sub pipeline {
     my ($self, $cmds) = @_;
     return [] unless $cmds && @$cmds;
-    my $sock = $self->_connect;
     my $wire = '';
     for my $c (@$cmds) {
         $wire .= _encode_resp(@$c);
     }
-    _write_all($sock, $wire);
-    my @results;
-    for (1 .. scalar(@$cmds)) {
-        push @results, $self->_read_resp;
+    for my $attempt (1 .. 2) {
+        my $results;
+        my $ok = eval {
+            my $sock = $self->_connect;
+            _write_all($sock, $wire);
+            my @res;
+            for (1 .. scalar(@$cmds)) {
+                push @res, $self->_read_resp;
+            }
+            $results = \@res;
+            1;
+        };
+        return $results if $ok;
+        my $err = $@;
+        if ($attempt == 1 && _is_conn_error($err)) {
+            $self->close();
+            next;
+        }
+        $self->close() if _is_conn_error($err);
+        die $err;
     }
-    return \@results;
 }
 
 sub ping {

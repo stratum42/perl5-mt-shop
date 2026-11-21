@@ -192,4 +192,25 @@ sub check_rate_limit {
     return wantarray ? (1, $rem, $reset) : 1;
 }
 
+# Remove stale per-IP rate-limit entries so the shared hash stays bounded.
+sub prune_rate_limits {
+    my ($self, $max_age_sec) = @_;
+    $max_age_sec = 120 unless defined $max_age_sec;
+    $max_age_sec = 0 if $max_age_sec < 0;
+
+    my $cutoff  = time() - $max_age_sec;
+    my $deleted = 0;
+    my @keys    = $self->{ratelimit}->keys;
+
+    for my $ip (@keys) {
+        my $raw = $self->{ratelimit}->get($ip);
+        if (!defined $raw || $raw !~ /^(\d+):\d+$/ || ($1 * 60) < $cutoff) {
+            $self->{ratelimit}->delete($ip);
+            $deleted++;
+        }
+    }
+
+    return $deleted;
+}
+
 1;

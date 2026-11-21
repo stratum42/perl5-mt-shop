@@ -819,4 +819,68 @@ my $adm_txt = _screen_text($subs_app->{screen});
 like($adm_txt, qr/3 members \| 5 active subs \| MRR: \$170\.47 \(Mem \$44\.97 \+ Sub \$125\.50\)/,
     "Admin Dashboard renders active members, active subs, and exact MT::Decimal MRR");
 
+# --- 8. App idle_timeout_sec clean exit (releases cart, saves KeyDB state, unregisters, closes) ---
+{
+    package MockIdleSession;
+    sub new { bless { out => '', closed => 0 }, shift }
+    sub size { (80, 24) }
+    sub env { {} }
+    sub read_input_nonblock { '' }
+    sub write_output { $_[0]->{out} .= ($_[1] // '') }
+    sub close { $_[0]->{closed}++ }
+
+    package MockIdleCart;
+    sub new { bless { released => 0 }, shift }
+    sub item_count { 0 }
+    sub totals { { total => '0.00' } }
+    sub clear {
+        my ($self, %opt) = @_;
+        $self->{released} = 1 if $opt{release_stock};
+    }
+
+    package MockIdleEventBus;
+    sub new { bless { unregistered => '' }, shift }
+    sub register_session { undef }
+    sub unregister_session { $_[0]->{unregistered} = $_[1] }
+
+    package MockIdleKeyDB;
+    sub new { bless { saved_fp => '' }, shift }
+    sub load_session_state { undef }
+    sub save_session_state {
+        my ($self, $fp, $state, $ttl) = @_;
+        $self->{saved_fp} = $fp;
+        return 1;
+    }
+}
+
+{
+    require Time::HiRes;
+    my $idle_sess = MockIdleSession->new();
+    my $idle_cart = MockIdleCart->new();
+    my $idle_eb   = MockIdleEventBus->new();
+    my $idle_kdb  = MockIdleKeyDB->new();
+
+    my $idle_app = Shop::TUI::App->new(
+        session          => $idle_sess,
+        session_id       => 'sess-idle-test',
+        inventory        => $subs_inv,
+        cart             => $idle_cart,
+        event_bus        => $idle_eb,
+        keydb            => $idle_kdb,
+        user             => { username => 'idleuser', fingerprint => 'SHA256:idle1' },
+        idle_timeout_sec => 0.1,
+    );
+
+    my $t0 = Time::HiRes::time();
+    $idle_app->run();
+    my $elapsed = Time::HiRes::time() - $t0;
+
+    cmp_ok($elapsed, '>=', 0.08, sprintf("idle_timeout_sec=0.1 waited >= 0.08s (%.3fs)", $elapsed));
+    cmp_ok($elapsed, '<',  2.0,  sprintf("idle_timeout_sec=0.1 exited promptly < 2.0s (%.3fs)", $elapsed));
+    is($idle_sess->{closed}, 1, "idle timeout closed SSH session");
+    is($idle_cart->{released}, 1, "idle timeout released uncommitted cart leases");
+    is($idle_eb->{unregistered}, 'sess-idle-test', "idle timeout unregistered EventBus session");
+    is($idle_kdb->{saved_fp}, 'SHA256:idle1', "idle timeout saved session state to KeyDB");
+}
+
 done_testing();

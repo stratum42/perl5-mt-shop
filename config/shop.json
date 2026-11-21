@@ -5,7 +5,8 @@
     "host_key": "config/host_ed25519_key",
     "allow_guest": true,
     "compression_level": 5,
-    "rate_limit_per_min": 60
+    "rate_limit_per_min": 60,
+    "idle_timeout_sec": 1800
   },
   "ops": {
     "host": "127.0.0.1",

@@ -169,6 +169,25 @@ is($a4, 0, 'rate limit call 4 blocked');
 is($r4, 0, 'rate limit remaining == 0 when blocked');
 is($metrics->get('ssh_auth_blocked_total'), 1, 'blocked request incremented ssh_auth_blocked_total');
 
+# Bounded rate-limit key sweeping
+my $stale_win1 = int((time() - 300) / 60);
+my $stale_win2 = int((time() - 600) / 60);
+$metrics->{ratelimit}->set('10.0.0.91', "$stale_win1:5");
+$metrics->{ratelimit}->set('10.0.0.92', "$stale_win2:2");
+my $pruned = $metrics->prune_rate_limits(120);
+is($pruned, 2, 'prune_rate_limits(120) deleted 2 stale IP entries');
+ok(!defined $metrics->{ratelimit}->get('10.0.0.91'), 'stale IP 10.0.0.91 removed');
+ok(!defined $metrics->{ratelimit}->get('10.0.0.92'), 'stale IP 10.0.0.92 removed');
+ok(defined $metrics->{ratelimit}->get('10.0.0.42'), 'active IP 10.0.0.42 preserved');
+
+# Bounded fallback idempotency hash cap
+my $cap_srv = Shop::Webhook::Server->new(idempotency_max => 5);
+for my $i (1 .. 8) {
+    ok($cap_srv->_check_and_mark_idempotent("evt_cap_$i"), "idempotency accepts new evt_cap_$i");
+}
+my @cap_keys = $cap_srv->{idempotency}->keys;
+cmp_ok(scalar(@cap_keys), '<=', 5, 'fallback idempotency hash stays capped at idempotency_max');
+
 # ===========================================================================
 # 2. Ed25519-Signed Cryptographic Order Receipts & Tamper Rejection
 # ===========================================================================

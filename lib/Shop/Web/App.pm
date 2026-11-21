@@ -296,13 +296,13 @@ sub _check_and_mark_idempotent {
     if (my $kdb = $self->keydb) {
         my $seen = eval { $kdb->get("wh:$event_id") };
         if (defined $seen && length $seen) {
-            $idem->set($event_id, '1') if $idem;
+            Shop::Webhook::Server::_mark_idempotent_local($idem, $event_id) if $idem;
             return 0;
         }
         eval { $kdb->set("wh:$event_id", '1', 86400); };
     }
 
-    $idem->set($event_id, '1') if $idem;
+    Shop::Webhook::Server::_mark_idempotent_local($idem, $event_id) if $idem;
     return 1;
 }
 

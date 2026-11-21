@@ -59,6 +59,7 @@ sub new {
         tolerance_sec         => defined $opt{tolerance_sec} ? int($opt{tolerance_sec}) : 300,
         shutdown_cell         => $opt{shutdown_cell},
         idempotency           => $opt{idempotency}    || MT::SharedHash->new,
+        idempotency_max       => defined $opt{idempotency_max} ? int($opt{idempotency_max}) : 10_000,
         http_engine           => $HAS_MOJO ? 'mojolicious-mt' : 'raw-socket',
         daemon                => undef,
         app                   => undef,
@@ -447,6 +448,39 @@ sub _json_response {
     return _http_response($status, $reason, 'application/json', $body);
 }
 
+# Store an event id with a timestamp and keep the fallback hash capped at $max_entries.
+sub _mark_idempotent_local {
+    my ($idem, $event_id, $max_entries, $ttl_sec) = @_;
+    return unless $idem && defined $event_id && length $event_id;
+    $max_entries = 10_000 unless defined $max_entries && $max_entries > 0;
+    $ttl_sec     = 86_400 unless defined $ttl_sec && $ttl_sec > 0;
+
+    my $now = time();
+    $idem->set($event_id, "$now");
+
+    my @keys = $idem->keys;
+    return if @keys <= $max_entries;
+
+    my $cutoff = $now - $ttl_sec;
+    my @live;
+    for my $k (@keys) {
+        my $ts = int($idem->get($k) // 0);
+        if ($ts > 0 && $ts < $cutoff) {
+            $idem->delete($k);
+        } else {
+            push @live, [ $k, $ts ];
+        }
+    }
+
+    if (@live > $max_entries) {
+        @live = sort { $a->[1] <=> $b->[1] } @live;
+        my $excess = scalar(@live) - $max_entries;
+        for (my $i = 0; $i < $excess; $i++) {
+            $idem->delete($live[$i][0]);
+        }
+    }
+}
+
 sub _check_and_mark_idempotent {
     my ($self, $event_id) = @_;
     return 1 unless defined $event_id && length $event_id;
@@ -460,13 +494,13 @@ sub _check_and_mark_idempotent {
     if ($self->{keydb}) {
         my $seen = eval { $self->{keydb}->get("wh:$event_id") };
         if (defined $seen && length $seen) {
-            $self->{idempotency}->set($event_id, '1');
+            _mark_idempotent_local($self->{idempotency}, $event_id, $self->{idempotency_max});
             return 0;
         }
         eval { $self->{keydb}->set("wh:$event_id", '1', 86400); };
     }
 
-    $self->{idempotency}->set($event_id, '1');
+    _mark_idempotent_local($self->{idempotency}, $event_id, $self->{idempotency_max});
     return 1;
 }
 
