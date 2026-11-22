@@ -15,7 +15,8 @@ xs/Shop-SSH-Crypto/pm_to_blib
 *.bundle
 *.bs
 
-# Runtime state, secrets, and host keys
+# Runtime state, secrets, generated launcher, and host keys
+bin/start-shop
 var/
 config/host_ed25519_key
 config/host_ed25519_key.pub

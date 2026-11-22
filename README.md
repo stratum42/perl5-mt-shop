@@ -7,6 +7,9 @@ place orders, inspect receipts, and (with an authorized admin key) operate
 inventory, purchase orders, outbound shipments, and database audit views from a
 terminal UI.
 
+New here? See the end-to-end [How-To Guide](docs/HOWTO.md) for a walkthrough of
+installation, TUI usage, admin mode, clustering, and testing.
+
 ## Features
 
 - Native SSHv2 transport (`Shop::SSH::*`) with `mlkem768x25519-sha256` and
@@ -61,13 +64,43 @@ terminal UI.
 
 ## Quick Start
 
-### SQLite (Local)
+### Automated Installer (Recommended)
+
+`install.pl` runs on stock system Perl (`/usr/bin/perl`, core modules only). It
+detects your platform and package manager, installs missing C/system
+dependencies (or builds `libsodium`, OpenSSL 3.5+, and `zlib` from GitHub
+source with `--deps-from-source`), clones and PGO-builds `perl5-mt` and
+`mojolicious-mt`, configures `config/shop.json`, writes `./bin/start-shop`, and
+runs the test suite.
+
+```sh
+# Interactive installer
+perl install.pl
+
+# Non-interactive local SQLite setup
+perl install.pl --db sqlite --yes
+
+# Non-interactive IBM Db2 + KeyDB setup with PGO enabled
+perl install.pl --db db2 --pgo --yes
+
+# Build C dependencies from GitHub source into <prefix>/deps
+perl install.pl --db sqlite --deps-from-source --yes
+
+# Preview detected plan and exact commands without modifying files or Docker
+perl install.pl --dry-run --yes
+
+# Start the server and connect
+./bin/start-shop
+ssh -C -p 2222 localhost
+```
+
+### Manual Setup: SQLite (Local)
 
 ```sh
 # Build the XS crypto/zlib extension and generate config/host_ed25519_key
 make crypto hostkey
 
-# Run the test suite (t/01_crypto.t through t/15_ssh_fuzz.t)
+# Run the test suite (16 test files: t/01_crypto.t through t/16_installer.t)
 make test
 
 # Run the AFL++ persistent-mode C/XS crypto fuzzer + ASan/UBSan corpus replay (default 60s)
@@ -80,7 +113,7 @@ make run
 ssh -C -p 2222 localhost
 ```
 
-### IBM Db2 Community Edition + KeyDB (Docker)
+### Manual Setup: IBM Db2 Community Edition + KeyDB (Docker)
 
 ```sh
 make docker-up
@@ -88,7 +121,7 @@ make init-db2
 SHOP_DB_DRIVER=db2 make run
 ```
 
-### IBM Informix (Docker)
+### Manual Setup: IBM Informix (Docker)
 
 ```sh
 docker compose -f docker/docker-compose.yml up -d --build informix informix-gateway
@@ -169,6 +202,9 @@ Numbers vary with CPU, OS allocator, terminal dimensions, and frame entropy.
 
 ## Documentation
 
+- [docs/HOWTO.md](docs/HOWTO.md): End-to-end walkthrough covering `install.pl`,
+  starting the server, TUI navigation, admin mode, 2-node clustering, and
+  tests/benchmarks/fuzzers.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Process model, concurrency,
   SSHv2 + XS crypto, ANSI diff renderer, hot-tier state, and measurement setup.
 - [docs/DATABASES.md](docs/DATABASES.md): SQLite, IBM Db2, IBM Informix, and
