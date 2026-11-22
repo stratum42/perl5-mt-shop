@@ -23,6 +23,9 @@ use Shop::SSH::Wire qw(:all);
 use constant {
     SERVER_VERSION     => 'SSH-2.0-perl5mt_shop_2.0',
     MAX_PACKET_SIZE    => 262144,            # 256 KiB safety cap
+    MAX_RX_BUF         => 327680,            # 320 KiB rx buffer cap
+    MAX_BANNER_LINE    => 255,               # RFC 4253 section 4.2
+    MAX_DEFERRED_RX    => 256,               # max queued packets during rekey
     DEFAULT_REKEY_BYTES => 512 * 1024 * 1024, # 512 MiB
 };
 
@@ -201,8 +204,11 @@ sub _fill_rx {
 
     my $total = 0;
     for (1 .. 8) {
+        last if length($self->{rx_buf}) >= MAX_RX_BUF;
+        my $want = MAX_RX_BUF - length($self->{rx_buf});
+        $want = 16384 if $want > 16384;
         my $buf = '';
-        my $n = sysread($self->{sock}, $buf, 16384);
+        my $n = sysread($self->{sock}, $buf, $want);
         if (defined $n) {
             if ($n == 0) {
                 $self->{closed} = 1;
@@ -210,7 +216,7 @@ sub _fill_rx {
             }
             $self->{rx_buf} .= $buf;
             $total += $n;
-            last if $n < 16384;
+            last if $n < $want;
         } elsif ($! == EINTR) {
             next;
         } elsif ($! == EAGAIN || $! == EWOULDBLOCK) {
@@ -227,14 +233,15 @@ sub _read_banner_line {
     my ($self, $deadline) = @_;
     while (1) {
         if ((my $idx = index($self->{rx_buf}, "\n")) >= 0) {
+            return undef if $idx + 1 > MAX_BANNER_LINE;
             my $line = substr($self->{rx_buf}, 0, $idx + 1, '');
             $line =~ s/\r?\n\z//;
             return $line;
         }
-        return undef if length($self->{rx_buf}) > 512;
+        return undef if length($self->{rx_buf}) > MAX_BANNER_LINE;
         my $got = $self->_fill_rx();
-        return undef if !defined($got) && length($self->{rx_buf}) == 0;
-        if (defined($got) && $got == 0) {
+        return undef if !defined($got);
+        if ($got == 0) {
             return undef if defined($deadline) && time() > $deadline;
             $self->_yield_io(1, 0, 0.01);
         }
@@ -304,7 +311,7 @@ sub handshake {
         }
     }
     die "SSH::Transport: invalid client banner"
-        unless defined($client_ver) && $client_ver =~ /^SSH-(?:2\.0|1\.99)-/;
+        unless defined($client_ver) && $client_ver =~ /^SSH-(?:2\.0|1\.99)-[\x20-\x7e]+$/;
     $self->{client_version} = $client_ver;
 
     return $self->_perform_kex(
@@ -355,30 +362,46 @@ sub _perform_kex {
                     $I_C = $pkt;
                     last;
                 }
+                if (@{ $self->{_deferred_rx} } >= MAX_DEFERRED_RX) {
+                    $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Too many deferred packets during rekey');
+                    die "SSH::Transport: too many deferred packets during rekey";
+                }
                 push @{ $self->{_deferred_rx} }, $pkt;
             }
         }
     }
 
     my $off = 0;
-    my $msg_type = unpack_byte($I_C, \$off);
-    if ($msg_type != SSH_MSG_KEXINIT) {
-        $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, "Expected KEXINIT (20), got $msg_type");
-        die "SSH::Transport: expected KEXINIT (20), got $msg_type";
+    my $msg_type = eval { unpack_byte($I_C, \$off) };
+    if ($@ || !defined($msg_type) || $msg_type != SSH_MSG_KEXINIT) {
+        $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, "Expected KEXINIT (20)");
+        die "SSH::Transport: expected KEXINIT (20)";
     }
 
+    if (length($I_C) < 17) {
+        $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Truncated KEXINIT');
+        die "SSH::Transport: truncated KEXINIT";
+    }
     $off += 16; # skip client cookie
-    my $cli_kex     = unpack_namelist($I_C, \$off);
-    my $cli_hk      = unpack_namelist($I_C, \$off);
-    my $cli_enc_c2s = unpack_namelist($I_C, \$off);
-    my $cli_enc_s2c = unpack_namelist($I_C, \$off);
-    my $cli_mac_c2s = unpack_namelist($I_C, \$off);
-    my $cli_mac_s2c = unpack_namelist($I_C, \$off);
-    my $cli_cmp_c2s = unpack_namelist($I_C, \$off);
-    my $cli_cmp_s2c = unpack_namelist($I_C, \$off);
-    my $cli_lang_c  = unpack_namelist($I_C, \$off);
-    my $cli_lang_s  = unpack_namelist($I_C, \$off);
-    my $first_follows = unpack_bool($I_C, \$off);
+    my ($cli_kex, $cli_hk, $cli_enc_c2s, $cli_enc_s2c, $cli_mac_c2s, $cli_mac_s2c,
+        $cli_cmp_c2s, $cli_cmp_s2c, $cli_lang_c, $cli_lang_s, $first_follows);
+    eval {
+        $cli_kex       = unpack_namelist($I_C, \$off);
+        $cli_hk        = unpack_namelist($I_C, \$off);
+        $cli_enc_c2s   = unpack_namelist($I_C, \$off);
+        $cli_enc_s2c   = unpack_namelist($I_C, \$off);
+        $cli_mac_c2s   = unpack_namelist($I_C, \$off);
+        $cli_mac_s2c   = unpack_namelist($I_C, \$off);
+        $cli_cmp_c2s   = unpack_namelist($I_C, \$off);
+        $cli_cmp_s2c   = unpack_namelist($I_C, \$off);
+        $cli_lang_c    = unpack_namelist($I_C, \$off);
+        $cli_lang_s    = unpack_namelist($I_C, \$off);
+        $first_follows = unpack_bool($I_C, \$off);
+    };
+    if ($@) {
+        $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Malformed KEXINIT');
+        die "SSH::Transport: malformed KEXINIT: $@";
+    }
 
     if ($is_initial) {
         $self->{client_wants_ext} = (grep { $_ eq 'ext-info-c' } @$cli_kex) ? 1 : 0;
@@ -430,7 +453,11 @@ sub _perform_kex {
         die "SSH::Transport: expected KEX_INIT (30), got $msg_type";
     }
 
-    my $Q_C = unpack_string($kex_init, \$off);
+    my $Q_C = eval { unpack_string($kex_init, \$off) };
+    if ($@ || !defined $Q_C) {
+        $self->disconnect(SSH_DISCONNECT_KEY_EXCHANGE_FAILED, 'Malformed KEX_INIT payload');
+        die "SSH::Transport: malformed KEX_INIT payload";
+    }
     my ($Q_S, $K_encoded);
 
     if ($kex_alg eq 'mlkem768x25519-sha256') {
@@ -442,7 +469,11 @@ sub _perform_kex {
         my $ek_1184       = substr($Q_C, 0, 1184);
         my $cli_x25519_pk = substr($Q_C, 1184, 32);
 
-        my ($ct_1088, $ss_pq) = mlkem768_encapsulate($ek_1184);
+        my ($ct_1088, $ss_pq) = eval { mlkem768_encapsulate($ek_1184) };
+        if ($@ || !defined($ct_1088) || !defined($ss_pq)) {
+            $self->disconnect(SSH_DISCONNECT_KEY_EXCHANGE_FAILED, 'Invalid ML-KEM-768 encapsulation key');
+            die "SSH::Transport: invalid ML-KEM-768 encapsulation key";
+        }
         my ($srv_priv, $srv_x25519_pk) = x25519_keypair();
         my $ss_x25519 = x25519_shared($srv_priv, $cli_x25519_pk);
         if (!defined $ss_x25519) {
@@ -705,7 +736,9 @@ sub recv_packet_nonblock {
                 my $plen = $is_gcm
                     ? unpack('N', $len4)
                     : chacha20_poly1305_openssh_decrypt_len($self->{rx_k2}, $self->{rx_seq}, $len4);
-                if ($plen < 2 || $plen > MAX_PACKET_SIZE || ($is_gcm && ($plen % 16) != 0)) {
+                my $min_plen = $is_gcm ? 16 : 8;
+                my $align    = $is_gcm ? 16 : 8;
+                if ($plen < $min_plen || $plen > MAX_PACKET_SIZE || ($plen % $align) != 0) {
                     $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Invalid packet length');
                     return undef;
                 }
@@ -747,7 +780,7 @@ sub recv_packet_nonblock {
             $self->{rekey_rx_bytes} += $need;
 
             my $pad_len = ord(substr($inner, 0, 1));
-            if (1 + $pad_len > length($inner)) {
+            if ($pad_len < 4 || 1 + $pad_len > length($inner)) {
                 $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Invalid padding length');
                 return undef;
             }
@@ -780,7 +813,7 @@ sub recv_packet_nonblock {
                 return '';
             }
             my $plen = unpack('N', substr($self->{rx_buf}, 0, 4));
-            if ($plen < 2 || $plen > MAX_PACKET_SIZE) {
+            if ($plen < 5 || $plen > MAX_PACKET_SIZE || ((4 + $plen) % 8) != 0) {
                 $self->{closed} = 1;
                 return undef;
             }
@@ -796,7 +829,7 @@ sub recv_packet_nonblock {
             $self->{wire_rx_bytes} += $need;
 
             my $pad_len = ord(substr($inner, 0, 1));
-            if (1 + $pad_len > length($inner)) {
+            if ($pad_len < 4 || 1 + $pad_len > length($inner)) {
                 $self->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Invalid padding length');
                 return undef;
             }

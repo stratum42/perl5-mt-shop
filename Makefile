@@ -10,9 +10,9 @@ HOSTKEY             := $(CURDIR)/config/host_ed25519_key
 MOJO_FLAGS := $(if $(wildcard $(MOJOLICIOUS_MT_ROOT)/lib),-I$(MOJOLICIOUS_MT_ROOT)/lib -I$(MOJOLICIOUS_MT_ROOT)/xs/blib/lib -I$(MOJOLICIOUS_MT_ROOT)/xs/blib/arch,)
 MOJO_KEYDB_FLAGS := $(if $(wildcard $(MOJOLICIOUS_MT_ROOT)/xs-keydb/blib/lib),-I$(MOJOLICIOUS_MT_ROOT)/xs-keydb/blib/lib -I$(MOJOLICIOUS_MT_ROOT)/xs-keydb/blib/arch,)
 
-PERL_FLAGS := -I$(PERL_LIB) -I$(SHOP_LIB) -I$(XS_DIR)/blib/lib -I$(XS_DIR)/blib/arch $(MOJO_FLAGS) $(MOJO_KEYDB_FLAGS)
+PERL_FLAGS := -I$(PERL_LIB) -I$(XS_DIR)/blib/arch -I$(XS_DIR)/blib/lib -I$(SHOP_LIB) $(MOJO_FLAGS) $(MOJO_KEYDB_FLAGS)
 
-.PHONY: all crypto hostkey docker-up docker-down init-db2 init-informix test bench run clean
+.PHONY: all crypto hostkey docker-up docker-down init-db2 init-informix test fuzz bench run clean
 
 all: crypto hostkey
 
@@ -52,6 +52,10 @@ test: crypto hostkey
 		$(PERL) $(PERL_FLAGS) "$$t" || exit 1; \
 	done
 	@echo "==> All tests passed!"
+
+fuzz: crypto hostkey
+	@echo "==> Running extended SSH/Crypto/Wire/TUI/JSON fuzz suite (FUZZ_ITERS=$${FUZZ_ITERS:-100000})..."
+	FUZZ_ITERS=$${FUZZ_ITERS:-100000} $(PERL) $(PERL_FLAGS) t/15_ssh_fuzz.t
 
 bench: crypto hostkey
 	@echo "==> Running perl5-mt-shop performance & egress benchmark..."

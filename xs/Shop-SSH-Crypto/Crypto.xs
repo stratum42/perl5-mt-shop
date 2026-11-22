@@ -10,6 +10,7 @@
 
 #include <openssl/bn.h>
 #include <openssl/ecdsa.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/param_build.h>
 #include <openssl/core_names.h>
@@ -66,7 +67,17 @@ typedef struct {
     int      level;
 } shop_zlib_ctx_t;
 
-#define SHOP_ZLIB_MAX_INFLATE (16 * 1024 * 1024)
+#define SHOP_ZLIB_MAX_INFLATE  (16 * 1024 * 1024)
+#define SHOP_MAX_CRYPTO_BUF    (16 * 1024 * 1024)
+#define SHOP_MAX_RSA_MOD_BYTES 1024
+#define SHOP_MAX_RSA_EXP_BYTES 64
+
+static int
+sv_is_defined(pTHX_ SV *sv)
+{
+    SvGETMAGIC(sv);
+    return SvOK(sv) ? 1 : 0;
+}
 
 static shop_zlib_ctx_t *
 sv_to_zlib_ctx(pTHX_ SV *self)
@@ -126,6 +137,8 @@ x25519_shared(priv_sv, pub_sv)
     SV *priv_sv
     SV *pub_sv
   CODE:
+    if (!sv_is_defined(aTHX_ priv_sv) || !sv_is_defined(aTHX_ pub_sv))
+        croak("x25519_shared: expected 32-byte priv and 32-byte pub");
     STRLEN priv_len, pub_len;
     const unsigned char *priv = (const unsigned char *)SvPVbyte(priv_sv, priv_len);
     const unsigned char *pub  = (const unsigned char *)SvPVbyte(pub_sv, pub_len);
@@ -158,6 +171,8 @@ void
 ed25519_seed_keypair(seed_sv)
     SV *seed_sv
   PPCODE:
+    if (!sv_is_defined(aTHX_ seed_sv))
+        croak("ed25519_seed_keypair: expected 32-byte seed");
     STRLEN seed_len;
     const unsigned char *seed = (const unsigned char *)SvPVbyte(seed_sv, seed_len);
     if (seed_len != crypto_sign_ed25519_SEEDBYTES)
@@ -175,6 +190,8 @@ ed25519_sign(msg_sv, sk_sv)
     SV *msg_sv
     SV *sk_sv
   CODE:
+    if (!sv_is_defined(aTHX_ msg_sv) || !sv_is_defined(aTHX_ sk_sv))
+        croak("ed25519_sign: msg and sk must be defined");
     STRLEN msg_len, sk_len;
     const unsigned char *msg = (const unsigned char *)SvPVbyte(msg_sv, msg_len);
     const unsigned char *sk  = (const unsigned char *)SvPVbyte(sk_sv, sk_len);
@@ -193,6 +210,9 @@ ed25519_verify(msg_sv, sig_sv, pk_sv)
     SV *sig_sv
     SV *pk_sv
   CODE:
+    if (!sv_is_defined(aTHX_ msg_sv) || !sv_is_defined(aTHX_ sig_sv) || !sv_is_defined(aTHX_ pk_sv)) {
+        XSRETURN_IV(0);
+    }
     STRLEN msg_len, sig_len, pk_len;
     const unsigned char *msg = (const unsigned char *)SvPVbyte(msg_sv, msg_len);
     const unsigned char *sig = (const unsigned char *)SvPVbyte(sig_sv, sig_len);
@@ -213,6 +233,9 @@ rsa_sha2_verify(msg_sv, sig_sv, n_sv, e_sv, bits)
     SV *e_sv
     IV bits
   CODE:
+    if (!sv_is_defined(aTHX_ msg_sv) || !sv_is_defined(aTHX_ sig_sv) || !sv_is_defined(aTHX_ n_sv) || !sv_is_defined(aTHX_ e_sv)) {
+        XSRETURN_IV(0);
+    }
     STRLEN msg_len, sig_len, n_len, e_len;
     const unsigned char *msg = (const unsigned char *)SvPVbyte(msg_sv, msg_len);
     const unsigned char *sig = (const unsigned char *)SvPVbyte(sig_sv, sig_len);
@@ -226,6 +249,12 @@ rsa_sha2_verify(msg_sv, sig_sv, n_sv, e_sv, bits)
         md = EVP_sha512();
     } else {
         croak("rsa_sha2_verify: bits must be 256 or 512");
+    }
+
+    if (n_len == 0 || n_len > SHOP_MAX_RSA_MOD_BYTES ||
+        e_len == 0 || e_len > SHOP_MAX_RSA_EXP_BYTES ||
+        sig_len == 0 || sig_len > SHOP_MAX_RSA_MOD_BYTES) {
+        XSRETURN_IV(0);
     }
 
     RETVAL = 0;
@@ -269,6 +298,7 @@ rsa_sha2_verify(msg_sv, sig_sv, n_sv, e_sv, bits)
     if (bld)    OSSL_PARAM_BLD_free(bld);
     if (bn_n)   BN_free(bn_n);
     if (bn_e)   BN_free(bn_e);
+    ERR_clear_error();
   OUTPUT:
     RETVAL
 
@@ -276,6 +306,8 @@ SV *
 sha256(data_sv)
     SV *data_sv
   CODE:
+    if (!sv_is_defined(aTHX_ data_sv))
+        croak("sha256: data must be defined");
     STRLEN len;
     const unsigned char *data = (const unsigned char *)SvPVbyte(data_sv, len);
     unsigned char out[crypto_hash_sha256_BYTES];
@@ -289,6 +321,8 @@ hmac_sha256(key_sv, data_sv)
     SV *key_sv
     SV *data_sv
   CODE:
+    if (!sv_is_defined(aTHX_ key_sv) || !sv_is_defined(aTHX_ data_sv))
+        croak("hmac_sha256: key and data must be defined");
     STRLEN key_len, data_len;
     const unsigned char *key  = (const unsigned char *)SvPVbyte(key_sv, key_len);
     const unsigned char *data = (const unsigned char *)SvPVbyte(data_sv, data_len);
@@ -310,6 +344,9 @@ const_time_eq(a_sv, b_sv)
     SV *a_sv
     SV *b_sv
   CODE:
+    if (!sv_is_defined(aTHX_ a_sv) || !sv_is_defined(aTHX_ b_sv)) {
+        XSRETURN_IV(0);
+    }
     STRLEN a_len, b_len;
     const unsigned char *a = (const unsigned char *)SvPVbyte(a_sv, a_len);
     const unsigned char *b = (const unsigned char *)SvPVbyte(b_sv, b_len);
@@ -327,6 +364,8 @@ void
 mlkem768_encapsulate(ek_sv)
     SV *ek_sv
   PPCODE:
+    if (!sv_is_defined(aTHX_ ek_sv))
+        croak("mlkem768_encapsulate: expected 1184-byte encapsulation key");
     STRLEN ek_len;
     const unsigned char *ek = (const unsigned char *)SvPVbyte(ek_sv, ek_len);
     if (ek_len != 1184) {
@@ -335,12 +374,14 @@ mlkem768_encapsulate(ek_sv)
 
     EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key_ex(NULL, "ML-KEM-768", NULL, ek, (size_t)ek_len);
     if (!pkey) {
+        ERR_clear_error();
         croak("mlkem768_encapsulate: EVP_PKEY_new_raw_public_key_ex(ML-KEM-768) failed");
     }
 
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_pkey(NULL, pkey, NULL);
     if (!ctx) {
         EVP_PKEY_free(pkey);
+        ERR_clear_error();
         croak("mlkem768_encapsulate: EVP_PKEY_CTX_new_from_pkey failed");
     }
 
@@ -355,6 +396,7 @@ mlkem768_encapsulate(ek_sv)
         sodium_memzero(ss, sizeof(ss));
         EVP_PKEY_CTX_free(ctx);
         EVP_PKEY_free(pkey);
+        ERR_clear_error();
         croak("mlkem768_encapsulate: EVP_PKEY_encapsulate failed");
     }
 
@@ -373,6 +415,9 @@ ecdsa_p256_verify(msg_sv, r_sv, s_sv, q_sv)
     SV *s_sv
     SV *q_sv
   CODE:
+    if (!sv_is_defined(aTHX_ msg_sv) || !sv_is_defined(aTHX_ r_sv) || !sv_is_defined(aTHX_ s_sv) || !sv_is_defined(aTHX_ q_sv)) {
+        XSRETURN_IV(0);
+    }
     STRLEN msg_len, r_len, s_len, q_len;
     const unsigned char *msg = (const unsigned char *)SvPVbyte(msg_sv, msg_len);
     const unsigned char *r_b = (const unsigned char *)SvPVbyte(r_sv, r_len);
@@ -439,6 +484,7 @@ ecdsa_p256_verify(msg_sv, r_sv, s_sv, q_sv)
     if (esig)    ECDSA_SIG_free(esig);
     if (bn_r)    BN_free(bn_r);
     if (bn_s)    BN_free(bn_s);
+    ERR_clear_error();
   OUTPUT:
     RETVAL
 
@@ -450,6 +496,8 @@ aes256_gcm_openssh_encrypt(key_sv, iv_sv, seq, aad_sv, payload_sv)
     SV *aad_sv
     SV *payload_sv
   CODE:
+    if (!sv_is_defined(aTHX_ key_sv) || !sv_is_defined(aTHX_ iv_sv) || !sv_is_defined(aTHX_ aad_sv) || !sv_is_defined(aTHX_ payload_sv))
+        croak("aes256_gcm_openssh_encrypt: arguments must be defined");
     STRLEN key_len, iv_len, aad_len, plen;
     const unsigned char *key     = (const unsigned char *)SvPVbyte(key_sv, key_len);
     const unsigned char *iv12    = (const unsigned char *)SvPVbyte(iv_sv, iv_len);
@@ -457,6 +505,9 @@ aes256_gcm_openssh_encrypt(key_sv, iv_sv, seq, aad_sv, payload_sv)
     const unsigned char *payload = (const unsigned char *)SvPVbyte(payload_sv, plen);
     if (key_len != 32 || iv_len != 12 || aad_len != 4) {
         croak("aes256_gcm_openssh_encrypt: expected 32-byte key, 12-byte iv, 4-byte aad");
+    }
+    if (plen > SHOP_MAX_CRYPTO_BUF) {
+        croak("aes256_gcm_openssh_encrypt: payload exceeds max buffer size");
     }
 
     unsigned char nonce[12];
@@ -497,6 +548,7 @@ aes256_gcm_openssh_encrypt(key_sv, iv_sv, seq, aad_sv, payload_sv)
     EVP_CIPHER_CTX_free(ctx);
 
     if (!ok) {
+        ERR_clear_error();
         SvREFCNT_dec(RETVAL);
         croak("aes256_gcm_openssh_encrypt: OpenSSL GCM encrypt failed");
     }
@@ -515,6 +567,8 @@ aes256_gcm_openssh_decrypt(key_sv, iv_sv, seq, aad_sv, enc_payload_sv, tag16_sv)
     SV *enc_payload_sv
     SV *tag16_sv
   CODE:
+    if (!sv_is_defined(aTHX_ key_sv) || !sv_is_defined(aTHX_ iv_sv) || !sv_is_defined(aTHX_ aad_sv) || !sv_is_defined(aTHX_ enc_payload_sv) || !sv_is_defined(aTHX_ tag16_sv))
+        croak("aes256_gcm_openssh_decrypt: arguments must be defined");
     STRLEN key_len, iv_len, aad_len, plen, tag_len;
     const unsigned char *key         = (const unsigned char *)SvPVbyte(key_sv, key_len);
     const unsigned char *iv12        = (const unsigned char *)SvPVbyte(iv_sv, iv_len);
@@ -523,6 +577,9 @@ aes256_gcm_openssh_decrypt(key_sv, iv_sv, seq, aad_sv, enc_payload_sv, tag16_sv)
     const unsigned char *tag16       = (const unsigned char *)SvPVbyte(tag16_sv, tag_len);
     if (key_len != 32 || iv_len != 12 || aad_len != 4 || tag_len != 16) {
         croak("aes256_gcm_openssh_decrypt: expected 32-byte key, 12-byte iv, 4-byte aad, 16-byte tag");
+    }
+    if (plen > SHOP_MAX_CRYPTO_BUF) {
+        croak("aes256_gcm_openssh_decrypt: payload exceeds max buffer size");
     }
 
     unsigned char nonce[12];
@@ -561,6 +618,7 @@ aes256_gcm_openssh_decrypt(key_sv, iv_sv, seq, aad_sv, enc_payload_sv, tag16_sv)
     EVP_CIPHER_CTX_free(ctx);
 
     if (!ok) {
+        ERR_clear_error();
         if (plen > 0) sodium_memzero(out, plen);
         SvREFCNT_dec(RETVAL);
         XSRETURN_UNDEF;
@@ -578,12 +636,16 @@ chacha20_poly1305_openssh_encrypt(k1_sv, k2_sv, seq, payload_sv)
     UV seq
     SV *payload_sv
   CODE:
+    if (!sv_is_defined(aTHX_ k1_sv) || !sv_is_defined(aTHX_ k2_sv) || !sv_is_defined(aTHX_ payload_sv))
+        croak("chacha20_poly1305_openssh_encrypt: arguments must be defined");
     STRLEN k1_len, k2_len, plen;
     const unsigned char *k1 = (const unsigned char *)SvPVbyte(k1_sv, k1_len);
     const unsigned char *k2 = (const unsigned char *)SvPVbyte(k2_sv, k2_len);
     const unsigned char *payload = (const unsigned char *)SvPVbyte(payload_sv, plen);
     if (k1_len != 32 || k2_len != 32)
         croak("chacha20_poly1305_openssh_encrypt: k1 and k2 must be 32 bytes");
+    if (plen > SHOP_MAX_CRYPTO_BUF)
+        croak("chacha20_poly1305_openssh_encrypt: payload exceeds max buffer size");
 
     unsigned char nonce[8];
     encode_be64(nonce, (uint64_t)seq);
@@ -627,6 +689,8 @@ chacha20_poly1305_openssh_decrypt_len(k2_sv, seq, enc4_sv)
     UV seq
     SV *enc4_sv
   CODE:
+    if (!sv_is_defined(aTHX_ k2_sv) || !sv_is_defined(aTHX_ enc4_sv))
+        croak("chacha20_poly1305_openssh_decrypt_len: arguments must be defined");
     STRLEN k2_len, enc_len;
     const unsigned char *k2   = (const unsigned char *)SvPVbyte(k2_sv, k2_len);
     const unsigned char *enc4 = (const unsigned char *)SvPVbyte(enc4_sv, enc_len);
@@ -650,6 +714,8 @@ chacha20_poly1305_openssh_decrypt_body(k1_sv, seq, enc4_sv, enc_payload_sv, tag1
     SV *enc_payload_sv
     SV *tag16_sv
   CODE:
+    if (!sv_is_defined(aTHX_ k1_sv) || !sv_is_defined(aTHX_ enc4_sv) || !sv_is_defined(aTHX_ enc_payload_sv) || !sv_is_defined(aTHX_ tag16_sv))
+        croak("chacha20_poly1305_openssh_decrypt_body: arguments must be defined");
     STRLEN k1_len, enc4_len, plen, tag_len;
     const unsigned char *k1          = (const unsigned char *)SvPVbyte(k1_sv, k1_len);
     const unsigned char *enc4        = (const unsigned char *)SvPVbyte(enc4_sv, enc4_len);
@@ -658,6 +724,8 @@ chacha20_poly1305_openssh_decrypt_body(k1_sv, seq, enc4_sv, enc_payload_sv, tag1
 
     if (k1_len != 32 || enc4_len != 4 || tag_len != 16)
         croak("chacha20_poly1305_openssh_decrypt_body: invalid argument lengths");
+    if (plen > SHOP_MAX_CRYPTO_BUF)
+        croak("chacha20_poly1305_openssh_decrypt_body: payload exceeds max buffer size");
 
     unsigned char nonce[8];
     encode_be64(nonce, (uint64_t)seq);
@@ -730,8 +798,12 @@ deflate(self, data_sv)
     SV *data_sv
   CODE:
     shop_zlib_ctx_t *ctx = sv_to_zlib_ctx(aTHX_ self);
+    if (!sv_is_defined(aTHX_ data_sv))
+        croak("Shop::SSH::Crypto::Zlib::deflate: data must be defined");
     STRLEN in_len;
     const unsigned char *in = (const unsigned char *)SvPVbyte(data_sv, in_len);
+    if (in_len > SHOP_ZLIB_MAX_INFLATE)
+        croak("Shop::SSH::Crypto::Zlib::deflate: input exceeds max buffer size");
 
     ctx->def.next_in  = (Bytef *)in;
     ctx->def.avail_in = (uInt)in_len;
@@ -773,8 +845,12 @@ inflate(self, data_sv, max_out=262144)
     IV max_out
   CODE:
     shop_zlib_ctx_t *ctx = sv_to_zlib_ctx(aTHX_ self);
+    if (!sv_is_defined(aTHX_ data_sv))
+        croak("Shop::SSH::Crypto::Zlib::inflate: data must be defined");
     STRLEN in_len;
     const unsigned char *in = (const unsigned char *)SvPVbyte(data_sv, in_len);
+    if (in_len > SHOP_ZLIB_MAX_INFLATE)
+        croak("Shop::SSH::Crypto::Zlib::inflate: input exceeds max buffer size");
 
     if (max_out <= 0) max_out = 262144;
     if (max_out > SHOP_ZLIB_MAX_INFLATE) max_out = SHOP_ZLIB_MAX_INFLATE;
@@ -824,10 +900,21 @@ inflate(self, data_sv, max_out=262144)
                 SvREFCNT_dec(RETVAL);
                 croak("SSH_ZIP_BOMB: Zlib::inflate exceeded max_out (%lu bytes)", (unsigned long)limit);
             }
+            if (rc == Z_STREAM_END) {
+                if (ctx->inf.avail_in > 0) {
+                    SvREFCNT_dec(RETVAL);
+                    croak("Shop::SSH::Crypto::Zlib::inflate: trailing data after stream end");
+                }
+                break;
+            }
             if (ctx->inf.avail_in == 0 && ctx->inf.avail_out > 0) {
                 break;
             }
-            if (rc == Z_BUF_ERROR && ctx->inf.avail_in == 0) {
+            if (rc == Z_BUF_ERROR && ctx->inf.avail_out > 0) {
+                if (ctx->inf.avail_in > 0) {
+                    SvREFCNT_dec(RETVAL);
+                    croak("Shop::SSH::Crypto::Zlib::inflate: stalled stream");
+                }
                 break;
             }
         }

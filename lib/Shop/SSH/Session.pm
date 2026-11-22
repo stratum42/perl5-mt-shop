@@ -11,6 +11,11 @@ use constant {
     LOCAL_WINDOW_SIZE  => 2 * 1024 * 1024,    # 2 MiB
     LOCAL_MAX_PACKET   => 32768,
     WINDOW_REFILL_MARK => 1024 * 1024,
+    MAX_ENV_VARS       => 64,
+    MAX_INPUT_BUF      => 262144,             # 256 KiB unread input cap
+    MAX_OPEN_PKTS      => 256,
+    MAX_TERM_LEN       => 128,
+    MAX_EXEC_LEN       => 4096,
 };
 
 sub new {
@@ -71,6 +76,7 @@ sub open_session {
     my ($self, $timeout) = @_;
     $timeout //= 15;
     my $deadline = time() + $timeout;
+    my $pkts     = 0;
 
     while (!$self->{shell_started} && !$self->{closed}) {
         my $rem = $deadline - time();
@@ -78,6 +84,12 @@ sub open_session {
 
         my $pkt = $self->{transport}->recv_packet_blocking($rem);
         die "SSH::Session: EOF before shell started" unless defined $pkt;
+        $pkts++;
+        if ($pkts > MAX_OPEN_PKTS) {
+            $self->{transport}->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Too many packets before shell');
+            $self->{closed} = 1;
+            die "SSH::Session: too many packets before shell started";
+        }
         $self->_dispatch_packet($pkt);
     }
     return 1;
@@ -87,6 +99,17 @@ sub _dispatch_packet {
     my ($self, $pkt) = @_;
     return if !defined($pkt) || length($pkt) == 0;
 
+    eval { $self->_dispatch_packet_inner($pkt) };
+    if ($@) {
+        $self->{eof}    = 1;
+        $self->{closed} = 1;
+        $self->{transport}->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Malformed session packet');
+    }
+    return;
+}
+
+sub _dispatch_packet_inner {
+    my ($self, $pkt) = @_;
     my $off = 0;
     my $mtype = unpack_byte($pkt, \$off);
 
@@ -131,9 +154,10 @@ sub _dispatch_packet {
             my $cols = unpack_u32($pkt, \$off);
             my $rows = unpack_u32($pkt, \$off);
             # px_w, px_h, modes follow (ignored)
-            if (defined($term) && $term ne '') {
+            if (defined($term) && $term ne '' && length($term) <= MAX_TERM_LEN) {
                 $self->{term} = $term;
-                $self->{env}{TERM} //= $term;
+                $self->{env}{TERM} //= $term
+                    if exists($self->{env}{TERM}) || scalar(keys %{ $self->{env} }) < MAX_ENV_VARS;
             }
             $self->{cols} = ($cols > 0 && $cols < 1000) ? $cols : 80;
             $self->{rows} = ($rows > 0 && $rows < 1000) ? $rows : 24;
@@ -143,9 +167,11 @@ sub _dispatch_packet {
             $ok = 1;
         } elsif ($req_type eq 'exec') {
             my $cmd = unpack_string($pkt, \$off);
-            $self->{exec_cmd}      = $cmd;
-            $self->{shell_started} = 1;
-            $ok = 1;
+            if (length($cmd) <= MAX_EXEC_LEN) {
+                $self->{exec_cmd}      = $cmd;
+                $self->{shell_started} = 1;
+                $ok = 1;
+            }
         } elsif ($req_type eq 'window-change') {
             my $cols = unpack_u32($pkt, \$off);
             my $rows = unpack_u32($pkt, \$off);
@@ -163,7 +189,9 @@ sub _dispatch_packet {
             if (!$@ && defined($name) && length($name) > 0 && length($name) <= 128
                 && defined($val) && length($val) <= 1024)
             {
-                $self->{env}{$name} = $val;
+                if (exists($self->{env}{$name}) || scalar(keys %{ $self->{env} }) < MAX_ENV_VARS) {
+                    $self->{env}{$name} = $val;
+                }
             }
             $ok = 1;
         } elsif ($req_type eq 'keepalive@openssh.com') {
@@ -182,6 +210,12 @@ sub _dispatch_packet {
         my $lchan = unpack_u32($pkt, \$off);
         my $data  = unpack_string($pkt, \$off);
         my $dlen  = length($data);
+        if ($dlen > $self->{local_window} || length($self->{input_buf}) + $dlen > MAX_INPUT_BUF) {
+            $self->{eof}    = 1;
+            $self->{closed} = 1;
+            $self->{transport}->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Channel window or buffer exceeded');
+            return;
+        }
         $self->{input_buf}    .= $data;
         $self->{local_window} -= $dlen;
 
@@ -199,7 +233,8 @@ sub _dispatch_packet {
     if ($mtype == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
         my $lchan = unpack_u32($pkt, \$off);
         my $add   = unpack_u32($pkt, \$off);
-        $self->{remote_window} += $add;
+        my $next  = $self->{remote_window} + $add;
+        $self->{remote_window} = ($next > 0xffffffff) ? 0xffffffff : $next;
         return;
     }
 

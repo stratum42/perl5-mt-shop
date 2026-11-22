@@ -6,6 +6,11 @@ use Time::HiRes qw(time);
 use Shop::SSH::Crypto qw(ed25519_verify rsa_sha2_verify ecdsa_p256_verify);
 use Shop::SSH::Wire qw(:all);
 
+use constant {
+    MAX_USERNAME_LEN => 128,
+    MAX_NON_AUTH_PKT => 64,
+};
+
 my %SUPPORTED_PUBKEY_ALGS = (
     'ssh-ed25519'         => 1,
     'ecdsa-sha2-nistp256' => 1,
@@ -27,10 +32,17 @@ sub authenticate {
     my $svc_pkt = $transport->recv_packet_blocking($deadline - time());
     die "SSH::Auth: EOF/timeout waiting for SERVICE_REQUEST" unless defined $svc_pkt;
     my $off = 0;
-    my $mtype = unpack_byte($svc_pkt, \$off);
+    my ($mtype, $svc_name);
+    eval {
+        $mtype    = unpack_byte($svc_pkt, \$off);
+        $svc_name = unpack_string($svc_pkt, \$off) if $mtype == SSH_MSG_SERVICE_REQUEST;
+    };
+    if ($@) {
+        $transport->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Malformed SERVICE_REQUEST');
+        die "SSH::Auth: malformed SERVICE_REQUEST";
+    }
     die "SSH::Auth: expected SERVICE_REQUEST (5), got $mtype"
         unless $mtype == SSH_MSG_SERVICE_REQUEST;
-    my $svc_name = unpack_string($svc_pkt, \$off);
     if ($svc_name ne 'ssh-userauth') {
         $transport->disconnect(SSH_DISCONNECT_SERVICE_NOT_AVAILABLE, "Unsupported service: $svc_name");
         die "SSH::Auth: unsupported service '$svc_name'";
@@ -39,9 +51,10 @@ sub authenticate {
         or die "SSH::Auth: failed to send SERVICE_ACCEPT";
 
     # 2. Process SSH_MSG_USERAUTH_REQUEST loop
-    my $attempts  = 0;
-    my $none_seen = 0;
-    my @methods   = ('publickey');
+    my $attempts     = 0;
+    my $non_auth_cnt = 0;
+    my $none_seen    = 0;
+    my @methods      = ('publickey');
     push @methods, 'keyboard-interactive' if $allow_guest;
 
     while ($attempts < $max_attempts) {
@@ -52,18 +65,34 @@ sub authenticate {
         die "SSH::Auth: EOF during authentication" unless defined $pkt;
 
         $off = 0;
-        $mtype = unpack_byte($pkt, \$off);
+        $mtype = eval { unpack_byte($pkt, \$off) };
+        if ($@ || !defined $mtype) {
+            $transport->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Empty auth packet');
+            die "SSH::Auth: empty auth packet";
+        }
         if ($mtype != SSH_MSG_USERAUTH_REQUEST) {
-            # Ignore unexpected non-auth packets during auth
+            # Ignore unexpected non-auth packets during auth, up to a strict cap
+            $non_auth_cnt++;
+            if ($non_auth_cnt > MAX_NON_AUTH_PKT) {
+                $transport->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Too many non-auth packets');
+                die "SSH::Auth: too many non-auth packets";
+            }
             next;
         }
 
         $attempts++;
-        my $username = unpack_string($pkt, \$off);
-        my $service  = unpack_string($pkt, \$off);
-        my $method   = unpack_string($pkt, \$off);
+        my ($username, $service, $method);
+        eval {
+            $username = unpack_string($pkt, \$off);
+            $service  = unpack_string($pkt, \$off);
+            $method   = unpack_string($pkt, \$off);
+        };
+        if ($@) {
+            $transport->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Malformed USERAUTH_REQUEST');
+            die "SSH::Auth: malformed USERAUTH_REQUEST";
+        }
 
-        if ($service ne 'ssh-connection') {
+        if ($service ne 'ssh-connection' || length($username) > MAX_USERNAME_LEN) {
             $transport->send_packet(
                 pack_byte(SSH_MSG_USERAUTH_FAILURE) . pack_namelist(@methods) . pack_bool(0)
             );
@@ -71,9 +100,16 @@ sub authenticate {
         }
 
         if ($method eq 'publickey') {
-            my $has_sig  = unpack_bool($pkt, \$off);
-            my $alg_name = unpack_string($pkt, \$off);
-            my $pub_blob = unpack_string($pkt, \$off);
+            my ($has_sig, $alg_name, $pub_blob);
+            eval {
+                $has_sig  = unpack_bool($pkt, \$off);
+                $alg_name = unpack_string($pkt, \$off);
+                $pub_blob = unpack_string($pkt, \$off);
+            };
+            if ($@) {
+                $transport->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Malformed publickey request');
+                die "SSH::Auth: malformed publickey request";
+            }
 
             unless ($SUPPORTED_PUBKEY_ALGS{$alg_name} && _valid_key_blob($alg_name, $pub_blob)) {
                 $transport->send_packet(
@@ -100,7 +136,11 @@ sub authenticate {
                 next;
             }
 
-            my $sig_blob = unpack_string($pkt, \$off);
+            my $sig_blob = eval { unpack_string($pkt, \$off) };
+            if ($@ || !defined $sig_blob) {
+                $transport->disconnect(SSH_DISCONNECT_PROTOCOL_ERROR, 'Truncated publickey signature');
+                die "SSH::Auth: truncated publickey signature";
+            }
             my $signed_data = pack_string($transport->session_id)
                             . pack_byte(SSH_MSG_USERAUTH_REQUEST)
                             . pack_string($username)

@@ -131,7 +131,8 @@ our %EXPORT_TAGS = (
 );
 
 sub pack_byte {
-    return pack('C', $_[0] & 0xff);
+    my $v = defined $_[0] ? $_[0] : 0;
+    return pack('C', $v & 0xff);
 }
 
 sub pack_bool {
@@ -139,7 +140,8 @@ sub pack_bool {
 }
 
 sub pack_u32 {
-    return pack('N', $_[0]);
+    my $v = defined $_[0] ? $_[0] : 0;
+    return pack('N', $v);
 }
 
 sub pack_string {
@@ -166,7 +168,9 @@ sub pack_mpint {
 
 sub unpack_byte {
     my ($buf, $off_ref) = @_;
-    die "SSH::Wire: truncated byte" if $$off_ref + 1 > length($buf);
+    die "SSH::Wire: truncated byte"
+        if !defined($buf) || !defined($off_ref) || !defined($$off_ref)
+        || $$off_ref < 0 || $$off_ref + 1 > length($buf);
     my $v = ord(substr($buf, $$off_ref, 1));
     $$off_ref += 1;
     return $v;
@@ -178,7 +182,9 @@ sub unpack_bool {
 
 sub unpack_u32 {
     my ($buf, $off_ref) = @_;
-    die "SSH::Wire: truncated u32" if $$off_ref + 4 > length($buf);
+    die "SSH::Wire: truncated u32"
+        if !defined($buf) || !defined($off_ref) || !defined($$off_ref)
+        || $$off_ref < 0 || $$off_ref + 4 > length($buf);
     my $v = unpack('N', substr($buf, $$off_ref, 4));
     $$off_ref += 4;
     return $v;
@@ -187,7 +193,8 @@ sub unpack_u32 {
 sub unpack_string {
     my ($buf, $off_ref) = @_;
     my $len = unpack_u32($buf, $off_ref);
-    die "SSH::Wire: truncated string (need $len)" if $$off_ref + $len > length($buf);
+    die "SSH::Wire: truncated string (need $len)"
+        if $len > length($buf) - $$off_ref;
     my $s = substr($buf, $$off_ref, $len);
     $$off_ref += $len;
     return $s;
@@ -209,6 +216,7 @@ sub unpack_mpint {
 
 sub pubkey_fingerprint {
     my ($blob) = @_;
+    die "SSH::Wire: pubkey_fingerprint requires defined blob" unless defined $blob;
     my $b64 = encode_base64(sha256($blob), '');
     $b64 =~ s/=+\z//;
     return "SHA256:$b64";
@@ -222,6 +230,7 @@ sub ed25519_pubkey_blob {
 
 sub parse_ed25519_pubkey_blob {
     my ($blob) = @_;
+    return undef unless defined $blob;
     my $off = 0;
     my $type = eval { unpack_string($blob, \$off) };
     return undef if $@ || !defined($type) || $type ne 'ssh-ed25519';
@@ -232,18 +241,20 @@ sub parse_ed25519_pubkey_blob {
 
 sub parse_rsa_pubkey_blob {
     my ($blob) = @_;
+    return () unless defined $blob;
     my $off = 0;
     my $type = eval { unpack_string($blob, \$off) };
     return () if $@ || !defined($type) || $type ne 'ssh-rsa';
     my $e = eval { unpack_mpint($blob, \$off) };
-    return () if $@ || !defined($e) || length($e) == 0;
+    return () if $@ || !defined($e) || length($e) == 0 || length($e) > 64;
     my $n = eval { unpack_mpint($blob, \$off) };
-    return () if $@ || !defined($n) || length($n) == 0;
+    return () if $@ || !defined($n) || length($n) == 0 || length($n) > 1024;
     return ($e, $n);
 }
 
 sub parse_ecdsa_p256_pubkey_blob {
     my ($blob) = @_;
+    return undef unless defined $blob;
     my $off = 0;
     my $type = eval { unpack_string($blob, \$off) };
     return undef if $@ || !defined($type) || $type ne 'ecdsa-sha2-nistp256';

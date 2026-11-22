@@ -10,6 +10,8 @@ our @EXPORT_OK = qw(encode_json decode_json);
 # 100% safe inside frozen perl5-mt MT::Worker threads (unlike JSON::PP which
 # mutates file-scoped lexicals that become read-only after MT::Image::freeze()).
 
+use constant MAX_DEPTH => 64;
+
 sub _esc_str {
     my ($s) = @_;
     $s =~ s/\\/\\\\/g;
@@ -24,7 +26,9 @@ sub _esc_str {
 }
 
 sub encode_json {
-    my ($v) = @_;
+    my ($v, $depth) = @_;
+    $depth //= 0;
+    die "JSON: maximum nesting depth exceeded\n" if $depth > MAX_DEPTH;
     return 'null' unless defined $v;
     my $r = ref($v);
     if (!$r) {
@@ -33,12 +37,12 @@ sub encode_json {
     if ($r eq 'HASH') {
         my @pairs;
         for my $k (sort keys %$v) {
-            push @pairs, _esc_str($k) . ':' . encode_json($v->{$k});
+            push @pairs, _esc_str($k) . ':' . encode_json($v->{$k}, $depth + 1);
         }
         return '{' . join(',', @pairs) . '}';
     }
     if ($r eq 'ARRAY') {
-        return '[' . join(',', map { encode_json($_) } @$v) . ']';
+        return '[' . join(',', map { encode_json($_, $depth + 1) } @$v) . ']';
     }
     if ($r eq 'JSON::PP::Boolean' || $r eq 'SCALAR') {
         return $$v ? 'true' : 'false';
@@ -75,6 +79,7 @@ sub _parse_str {
             elsif ($e eq 'r') { $out .= "\r"; }
             elsif ($e eq 't') { $out .= "\t"; }
             elsif ($e eq 'u') {
+                die "JSON: invalid \\u escape\n" if $$pref + 4 > $len;
                 my $hex = substr($$sref, $$pref, 4);
                 die "JSON: invalid \\u escape\n" unless $hex =~ /^[0-9a-fA-F]{4}$/;
                 $$pref += 4;
@@ -92,7 +97,9 @@ sub _parse_str {
 }
 
 sub _parse_val {
-    my ($sref, $pref) = @_;
+    my ($sref, $pref, $depth) = @_;
+    $depth //= 0;
+    die "JSON: maximum nesting depth exceeded\n" if $depth > MAX_DEPTH;
     _skip_ws($sref, $pref);
     my $len = length($$sref);
     die "JSON: unexpected EOF\n" if $$pref >= $len;
@@ -111,12 +118,15 @@ sub _parse_val {
         }
         while (1) {
             _skip_ws($sref, $pref);
+            die "JSON: unexpected EOF in object\n" if $$pref >= $len;
             my $k = _parse_str($sref, $pref);
             _skip_ws($sref, $pref);
-            die "JSON: expected ':' at $$pref\n" unless substr($$sref, $$pref, 1) eq ':';
+            die "JSON: expected ':' at $$pref\n"
+                if $$pref >= $len || substr($$sref, $$pref, 1) ne ':';
             $$pref++;
-            $obj{$k} = _parse_val($sref, $pref);
+            $obj{$k} = _parse_val($sref, $pref, $depth + 1);
             _skip_ws($sref, $pref);
+            die "JSON: unexpected EOF in object\n" if $$pref >= $len;
             my $sep = substr($$sref, $$pref, 1);
             if ($sep eq '}') { $$pref++; return \%obj; }
             die "JSON: expected ',' or '}' at $$pref\n" unless $sep eq ',';
@@ -132,8 +142,9 @@ sub _parse_val {
             return \@arr;
         }
         while (1) {
-            push @arr, _parse_val($sref, $pref);
+            push @arr, _parse_val($sref, $pref, $depth + 1);
             _skip_ws($sref, $pref);
+            die "JSON: unexpected EOF in array\n" if $$pref >= $len;
             my $sep = substr($$sref, $$pref, 1);
             if ($sep eq ']') { $$pref++; return \@arr; }
             die "JSON: expected ',' or ']' at $$pref\n" unless $sep eq ',';

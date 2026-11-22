@@ -76,14 +76,20 @@ sub parse {
                 }
 
                 # CSI: \e[ followed by parameter bytes (0x30-0x3F), intermediate (0x20-0x2F), final (0x40-0x7E)
-                my $j = $i + 2;
-                while ($j < $len) {
+                # Cap scan window at 32 bytes so malformed/unterminated CSI streams stay O(1) per ESC.
+                my $j     = $i + 2;
+                my $limit = ($i + 32 < $len) ? ($i + 32) : $len;
+                my $found = 0;
+                while ($j < $limit) {
                     my $cb = ord(substr($buf, $j, 1));
-                    last if $cb >= 0x40 && $cb <= 0x7e;
+                    if ($cb >= 0x40 && $cb <= 0x7e) {
+                        $found = 1;
+                        last;
+                    }
                     $j++;
                 }
-                if ($j >= $len) {
-                    # Incomplete CSI sequence; if absurdly long, drop ESC
+                if (!$found) {
+                    # Incomplete or overlong CSI sequence; buffer only if short and at end of chunk
                     if ($len - $i > 24) {
                         push @events, { type => 'ESC' };
                         $i++;
@@ -98,7 +104,7 @@ sub parse {
                 my $final  = substr($buf, $j, 1);
 
                 # SGR Mouse reporting: \e[<Cb;Cx;CyM (press) or \e[<Cb;Cx;Cym (release)
-                if (($final eq 'M' || $final eq 'm') && $params =~ /\A<(\d+);(\d+);(\d+)\z/) {
+                if (($final eq 'M' || $final eq 'm') && $params =~ /\A<(\d{1,5});(\d{1,5});(\d{1,5})\z/) {
                     my ($cb, $cx, $cy) = (int($1), int($2), int($3));
                     my $press = ($final eq 'M') ? 1 : 0;
                     my $btn;
