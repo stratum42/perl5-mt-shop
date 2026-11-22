@@ -228,11 +228,19 @@ errors) and runs `prune_rate_limits` and expired blackhole ban pruning every
 worker threads, writes a final `MT::Checkpoint` to `var/inventory.mtck`, and
 shuts down the DB worker pool.
 
-## Running Tests and Benchmarks
+## Running Tests, Fuzzers, and Benchmarks
 
 ```sh
-# Local test suite (14 suites: t/01_crypto.t through t/14_cluster_wavefunction_blackhole.t; Docker-only checks skip cleanly)
+# Local test suite (Docker-only checks skip cleanly)
 make test
+
+# Extended Perl SSH/Crypto/Wire/TUI/JSON fuzz suite
+make fuzz
+
+# Coverage-guided AFL++ persistent-mode C/XS crypto fuzzer + ASan/UBSan corpus replay
+make fuzz-afl
+# Override campaign duration in seconds (default 60):
+AFL_SECONDS=300 make fuzz-afl
 
 # Full test suite including live Db2, Informix, and KeyDB containers
 SHOP_TEST_DOCKER=1 make test
@@ -242,6 +250,15 @@ SHOP_TEST_DOCKER=1 KEYDB_PORT=6380 make test
 # Performance and 100-frame egress benchmark
 make bench
 ```
+
+`make fuzz-afl` builds `fuzz/fuzz_ssh_crypto.c` with `afl-clang-fast` (persistent
+mode) and `clang -fsanitize=address,undefined`, runs `afl-fuzz` against the seed
+corpus in `fuzz/corpus/` across all 8 `Shop::SSH::Crypto` C/XS surfaces
+(`mlkem768_encapsulate`, `x25519_shared`, `ed25519_verify`, `rsa_sha2_verify`,
+`ecdsa_p256_verify`, `chacha20_poly1305_openssh_decrypt`,
+`aes256_gcm_openssh_decrypt`, and `Zlib::inflate`), and replays every discovered
+queue entry under ASan and UBSan. Pass `ASAN=1` to `make -C fuzz` to build the
+AFL++ binary itself with `AFL_USE_ASAN=1`.
 
 Optional benchmark overrides:
 

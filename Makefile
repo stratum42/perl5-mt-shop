@@ -12,7 +12,7 @@ MOJO_KEYDB_FLAGS := $(if $(wildcard $(MOJOLICIOUS_MT_ROOT)/xs-keydb/blib/lib),-I
 
 PERL_FLAGS := -I$(PERL_LIB) -I$(XS_DIR)/blib/arch -I$(XS_DIR)/blib/lib -I$(SHOP_LIB) $(MOJO_FLAGS) $(MOJO_KEYDB_FLAGS)
 
-.PHONY: all crypto hostkey docker-up docker-down init-db2 init-informix test fuzz bench run clean
+.PHONY: all crypto hostkey docker-up docker-down init-db2 init-informix test fuzz fuzz-afl bench run clean
 
 all: crypto hostkey
 
@@ -53,9 +53,15 @@ test: crypto hostkey
 	done
 	@echo "==> All tests passed!"
 
+AFL_SECONDS         ?= 60
+
 fuzz: crypto hostkey
 	@echo "==> Running extended SSH/Crypto/Wire/TUI/JSON fuzz suite (FUZZ_ITERS=$${FUZZ_ITERS:-100000})..."
 	FUZZ_ITERS=$${FUZZ_ITERS:-100000} $(PERL) $(PERL_FLAGS) t/15_ssh_fuzz.t
+
+fuzz-afl:
+	@echo "==> Running AFL++ persistent-mode C/XS crypto fuzz campaign (AFL_SECONDS=$(AFL_SECONDS))..."
+	$(MAKE) -C $(CURDIR)/fuzz AFL_SECONDS=$(AFL_SECONDS) run
 
 bench: crypto hostkey
 	@echo "==> Running perl5-mt-shop performance & egress benchmark..."
@@ -67,4 +73,5 @@ run: crypto hostkey
 
 clean:
 	@if [ -f $(XS_DIR)/Makefile ]; then cd $(XS_DIR) && $(MAKE) realclean; fi
+	@$(MAKE) -C $(CURDIR)/fuzz clean
 	@rm -rf $(CURDIR)/var/*.mtck $(CURDIR)/var/*.db

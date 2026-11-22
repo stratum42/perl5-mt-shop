@@ -67,8 +67,11 @@ terminal UI.
 # Build the XS crypto/zlib extension and generate config/host_ed25519_key
 make crypto hostkey
 
-# Run the test suite (14 suites: t/01_crypto.t through t/14_cluster_wavefunction_blackhole.t)
+# Run the test suite (t/01_crypto.t through t/15_ssh_fuzz.t)
 make test
+
+# Run the AFL++ persistent-mode C/XS crypto fuzzer + ASan/UBSan corpus replay (default 60s)
+make fuzz-afl
 
 # Start the SSH storefront (:2222) and ops HTTP server (:8088)
 make run

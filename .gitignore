@@ -33,6 +33,12 @@ docker/.env
 *.swp
 *~
 
+# Fuzzing build and runtime outputs
+fuzz/fuzz_ssh_crypto
+fuzz/fuzz_ssh_crypto_asan
+fuzz/*.dSYM/
+fuzz/out/
+
 # Python bytecode
 __pycache__/
 *.pyc
